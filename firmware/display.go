@@ -64,6 +64,12 @@ func usageChanged(a, b *UsageData) bool {
 		a.W1Limit != b.W1Limit
 }
 
+func redContentChanged(a, b *UsageData) bool {
+	return a.H5Used != b.H5Used ||
+		a.H5Limit != b.H5Limit ||
+		a.H5ResetMin != b.H5ResetMin
+}
+
 func renderUsageScreen(d *EPD, u *UsageData) {
 	d.ClearBuffer()
 

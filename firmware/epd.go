@@ -18,11 +18,73 @@ const (
 // If red appears inverted on the display, flip this single constant.
 const redPixelClearsBit = false
 
-// useFastRefresh spoofs the temperature register to 90°C before each display
-// update, causing the OTP waveform search to select WS7 (the high-temperature
-// waveform with shorter/faster phases). Set to false to use the standard
-// room-temperature waveform (slower but most reliable).
+// useFastRefresh writes a custom LUT (cmd 0x32) with explicit voltage registers
+// (0x03/0x04/0x2C/0x3F) and uses 0xC7 (no OTP reload) for display updates.
+// This gives 4 visible transitions instead of ~15 with the OTP waveform.
+// Set to false to use the standard OTP waveform (0xF7, slow but most reliable).
 const useFastRefresh = true
+
+// fullLUT: 4 groups — clear-to-black, clear-to-white, apply BW, apply Red.
+// Used for initial display and when red content changes.
+var fullLUT = [153]byte{
+	// LUT0 (black, R=0 BW=0): G0=VSL G1=VSH1 G2=VSL G3=0
+	0x80, 0x40, 0x80, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT1 (white, R=0 BW=1): G0=VSL G1=VSH1 G2=VSH1 G3=0
+	0x80, 0x40, 0x40, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT2 (red, R=1 BW=0): G0=VSL G1=VSH1 G2=0 G3=VSH2
+	0x80, 0x40, 0x00, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT3 (red, R=1 BW=1): same as LUT2
+	0x80, 0x40, 0x00, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT4 (VCOM): all DCVCOM
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// Group 0 (clear to black): TP=10, RP=0
+	10, 0, 0, 0, 0, 0, 0,
+	// Group 1 (clear to white): TP=10, RP=0
+	10, 0, 0, 0, 0, 0, 0,
+	// Group 2 (BW content): TP=20, RP=1 (2 reps)
+	20, 0, 0, 0, 0, 0, 1,
+	// Group 3 (Red content): TP=40, RP=2 (3 reps)
+	40, 0, 0, 0, 0, 0, 2,
+	// Groups 4-11: inactive
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// FR
+	0x33, 0x33, 0, 0, 0, 0,
+	// XON
+	0, 0, 0,
+}
+
+// diffLUT: 1 group — differential B/W transitions only, no clearing.
+// In Mode 2, the SSD1680 compares old and new RAM; only changed pixels are driven.
+// LUT0 = old0→new0 (same, no drive), LUT1 = 0→1 (VSH1→white),
+// LUT2 = 1→0 (VSL→black), LUT3 = old1→new1 (same, no drive).
+var diffLUT = [153]byte{
+	// LUT0 (no change): all VSS
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT1 (black→white): G0=VSH1
+	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT2 (white→black): G0=VSL
+	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT3 (no change): all VSS
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT4 (VCOM): all DCVCOM
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// Group 0: TP=10, RP=1 (2 reps)
+	10, 0, 0, 0, 0, 0, 1,
+	// Groups 1-11: inactive
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	// FR
+	0x33, 0, 0, 0, 0, 0,
+	// XON
+	0, 0, 0,
+}
 
 type EPD struct {
 	bus       drivers.SPI
@@ -33,7 +95,7 @@ type EPD struct {
 	buffer    [epdW / 8 * epdH]uint8 // black/white RAM
 	redBuffer [epdW / 8 * epdH]uint8 // red RAM
 
-	// Set by Display() for diagnostic reporting.
+	DiffCount     int
 	LastRefreshMS int
 	LastTimeout   bool
 }
@@ -85,23 +147,8 @@ func (d *EPD) Configure() {
 		d.redBuffer[i] = 0x00
 	}
 
-	if useFastRefresh {
-		// Temperature trick: load OTP with spoofed 90°C so the OTP search
-		// selects WS7 (high-temp waveform with shorter/faster phases).
-		d.cmd(0x22)
-		d.data(0xB1) // load temp from sensor + load LUT (Mode 1)
-		d.cmd(0x20)
-		d.waitBusy(5000)
-		// Spoof temperature register to 90°C
-		d.cmd(0x1A)
-		d.data(0x5A) // temp[11:4] = 0x5A
-		d.data(0x00) // temp[3:0] = 0
-		// Reload LUT from OTP using spoofed temp (selects WS7)
-		d.cmd(0x22)
-		d.data(0x91) // load LUT Mode 1 (no temp sensor read, uses register)
-		d.cmd(0x20)
-		d.waitBusy(5000)
-	}
+	// No custom LUT written here — DisplayFull() uses OTP (0xF7),
+	// DisplayDiff() writes diffLUT + voltage registers before each call.
 }
 
 func (d *EPD) SetPixel(x, y int16, c color.RGBA) {
@@ -142,11 +189,17 @@ func (d *EPD) SetPixel(x, y int16, c color.RGBA) {
 	}
 }
 
+// Display does a full refresh (used by error/setup/calibration screens).
 func (d *EPD) Display() error {
+	return d.DisplayFull()
+}
+
+// DisplayFull writes both BW and Red buffers and does a full OTP refresh with
+// proper clearing phases. Always uses 0xF7 (load temp + OTP LUT + display) —
+// the OTP waveform is the only reliable way to drive red and do a proper clear.
+func (d *EPD) DisplayFull() error {
 	d.setWindow(0, 0, epdW-1, epdH-1)
 	d.setPointerNoWait(0, 0)
-
-	// Let any in-flight USBD DMA complete before bulk SPI.
 	time.Sleep(5 * time.Millisecond)
 
 	d.cmd(0x24)
@@ -156,35 +209,64 @@ func (d *EPD) Display() error {
 	d.cmd(0x26)
 	d.dataBlock(d.redBuffer[:])
 
-	if useFastRefresh {
-		// Re-spoof temperature and reload fast LUT before each display update.
-		// cmd 0x32 (custom LUT) does NOT affect the active display — only OTP
-		// loading populates the active waveform register on the SSD1680.
-		d.cmd(0x1A)
-		d.data(0x5A) // 90°C
-		d.data(0x00)
-		d.cmd(0x22)
-		d.data(0x91) // load LUT Mode 1 using spoofed temp → selects WS7
-		d.cmd(0x20)
-		d.waitBusy(5000)
-		// Display using the loaded fast LUT (no reload)
-		d.cmd(0x22)
-		d.data(0xC7) // display Mode 1, no LUT/temp reload
-	} else {
-		d.cmd(0x22)
-		d.data(0xF7) // load temp + LUT from OTP + display Mode 1
-	}
-	d.cmd(0x20) // master activation
+	// Always use OTP for full refresh — custom LUT voltage values are
+	// panel-specific and ours aren't calibrated. OTP is reliable.
+	d.cmd(0x22)
+	d.data(0xF7) // load temp + load OTP LUT + display Mode 1
+	d.cmd(0x20)
 
 	ms, timedOut := d.waitBusy(25000)
 	d.LastRefreshMS = ms
 	d.LastTimeout = timedOut
+	d.DiffCount = 0
+	return nil
+}
+
+// DisplayDiff writes only the BW buffer and uses Mode 2 (differential) so the
+// SSD1680 compares old and new RAM and only drives pixels that changed.
+// Unchanged pixels don't flash at all. Red RAM is untouched — red stays visible.
+func (d *EPD) DisplayDiff() error {
+	if !useFastRefresh {
+		return d.DisplayFull()
+	}
+
+	// Write voltage registers + custom diffLUT. The preceding DisplayFull()
+	// used 0xF7 which loaded OTP values — we must overwrite with our own.
+	d.cmd(0x03)
+	d.data(0x17) // VGH = 20V
+	d.cmd(0x04)
+	d.data(0x41) // VSH1
+	d.data(0xAE) // VSH2
+	d.data(0x32) // VSL
+	d.cmd(0x2C)
+	d.data(0x36) // VCOM
+	d.cmd(0x3F)
+	d.data(0x22) // EOPT
+	d.cmd(0x32)
+	d.dataBlock(diffLUT[:])
+
+	d.setWindow(0, 0, epdW-1, epdH-1)
+	d.setPointerNoWait(0, 0)
+	time.Sleep(5 * time.Millisecond)
+
+	d.cmd(0x24)
+	d.dataBlock(d.buffer[:])
+	// Red RAM (0x26) intentionally NOT written — red pixels stay from last full refresh
+
+	d.cmd(0x22)
+	d.data(0xCF) // custom LUT + Mode 2 (differential)
+	d.cmd(0x20)
+
+	ms, timedOut := d.waitBusy(25000)
+	d.LastRefreshMS = ms
+	d.LastTimeout = timedOut
+	d.DiffCount++
 	return nil
 }
 
 func (d *EPD) ClearDisplay() {
 	d.ClearBuffer()
-	d.Display()
+	d.DisplayFull()
 }
 
 func (d *EPD) ClearBuffer() {

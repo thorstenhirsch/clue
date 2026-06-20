@@ -30,16 +30,26 @@ func main() {
 	}
 	log.Printf("Loaded %s credentials (expires %s)", creds.SubscriptionType, creds.ExpiresAt.Format(time.RFC3339))
 
-	portName := *portFlag
-	if portName == "" {
-		portName, err = detectPort()
-		if err != nil {
-			log.Fatalf("No serial port found: %v\nUse --port to specify manually.", err)
-		}
-	}
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	portName := *portFlag
+	if portName == "" {
+		log.Println("Waiting for device...")
+		for {
+			select {
+			case sig := <-sigCh:
+				log.Printf("Received %s, shutting down", sig)
+				return
+			default:
+			}
+			portName, err = detectPort()
+			if err == nil {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
 
 	log.Printf("Opening %s", portName)
 	port, err := serial.Open(portName, &serial.Mode{
@@ -57,7 +67,7 @@ func main() {
 	scanner := bufio.NewScanner(port)
 	scanner.Buffer(make([]byte, 8192), 8192)
 
-	log.Println("Waiting for device...")
+	log.Println("Waiting for handshake...")
 	sendLine(port, "G")
 	connected := false
 	for !connected {
@@ -85,6 +95,9 @@ func main() {
 	ticker := time.NewTicker(*intervalFlag)
 	defer ticker.Stop()
 
+	refreshTimer := time.NewTimer(time.Until(next4AM()))
+	defer refreshTimer.Stop()
+
 	var lastH5ResetMin int64 = -99
 	pollFn := func() {
 		lastH5ResetMin = poll(client, port, lastH5ResetMin)
@@ -95,6 +108,11 @@ func main() {
 		select {
 		case <-ticker.C:
 			pollFn()
+		case <-refreshTimer.C:
+			log.Println("Nightly full refresh")
+			sendLine(port, "F")
+			pollFn()
+			refreshTimer.Reset(time.Until(next4AM()))
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
 			return
@@ -114,7 +132,6 @@ func poll(client *claude.Client, port serial.Port, prevH5ResetMin int64) int64 {
 		return prevH5ResetMin
 	}
 
-	// Convert absolute reset times to local minute-of-day and weekday.
 	h5resetMin := int64(-1)
 	w1resetDay := int64(-1)
 	w1resetMin := int64(-1)
@@ -124,7 +141,7 @@ func poll(client *claude.Client, port serial.Port, prevH5ResetMin int64) int64 {
 	}
 	if !usage.W1Reset.IsZero() {
 		local := usage.W1Reset.Local()
-		w1resetDay = int64(local.Weekday()) // 0=Sun..6=Sat
+		w1resetDay = int64(local.Weekday())
 		w1resetMin = int64(local.Hour()*60 + local.Minute())
 	}
 
@@ -138,7 +155,6 @@ func poll(client *claude.Client, port serial.Port, prevH5ResetMin int64) int64 {
 		}
 	}
 
-	// Extended 7-field protocol: h5used:h5limit:w1used:w1limit:h5resetMin:w1resetDay:w1resetMin
 	msg := "U:" +
 		strconv.FormatInt(usage.H5Used, 10) + ":" +
 		strconv.FormatInt(usage.H5Limit, 10) + ":" +
@@ -171,4 +187,13 @@ func detectPort() (string, error) {
 		return ports[0], nil
 	}
 	return "", fmt.Errorf("no serial ports detected")
+}
+
+func next4AM() time.Time {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	return next
 }

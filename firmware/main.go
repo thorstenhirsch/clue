@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const buildID = "CLUE-FW-16"
+const buildID = "CLUE-FW-17"
 
 type state uint8
 
@@ -93,10 +93,17 @@ func handleMessage(line string) {
 		if currentState == stateRunning && !usageChanged(&u, &lastUsage) {
 			return
 		}
+		needsFull := currentState != stateRunning ||
+			redContentChanged(&u, &lastUsage) ||
+			display.DiffCount >= 10
 		currentState = stateRunning
 		lastUsage = u
 		renderUsageScreen(&display, &u)
-		display.Display()
+		if needsFull {
+			display.DisplayFull()
+		} else {
+			display.DisplayDiff()
+		}
 
 	case line == "E":
 		currentState = stateError
@@ -113,6 +120,12 @@ func handleMessage(line string) {
 		currentState = stateWaiting
 		renderConnectingScreen(&display)
 		display.Display()
+
+	case line == "F":
+		if currentState == stateRunning {
+			renderUsageScreen(&display, &lastUsage)
+			display.DisplayFull()
+		}
 
 	case line == "T:B":
 		display.FillBlack()
