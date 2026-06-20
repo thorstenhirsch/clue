@@ -1,0 +1,6 @@
+# Build artifacts
+/clue
+*.uf2
+
+# Claude Code local settings
+.claude/
