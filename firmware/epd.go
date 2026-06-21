@@ -9,8 +9,10 @@ import (
 )
 
 const (
-	epdW = 128
-	epdH = 296
+	epdW      = 128
+	epdH      = 296
+	epdStride = epdW / 8   // 16 bytes per gate line
+	epdBufSz  = epdStride * epdH // 4736 bytes
 )
 
 // redPixelClearsBit controls the red RAM polarity for the SSD1680.
@@ -18,57 +20,56 @@ const (
 // If red appears inverted on the display, flip this single constant.
 const redPixelClearsBit = false
 
-// useFastRefresh writes a custom LUT (cmd 0x32) with explicit voltage registers
-// (0x03/0x04/0x2C/0x3F) and uses 0xC7 (no OTP reload) for display updates.
-// This gives 4 visible transitions instead of ~15 with the OTP waveform.
-// Set to false to use the standard OTP waveform (0xF7, slow but most reliable).
-const useFastRefresh = true
-
-// fullLUT: 4 groups — clear-to-black, clear-to-white, apply BW, apply Red.
-// Used for initial display and when red content changes.
-var fullLUT = [153]byte{
-	// LUT0 (black, R=0 BW=0): G0=VSL G1=VSH1 G2=VSL G3=0
-	0x80, 0x40, 0x80, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT1 (white, R=0 BW=1): G0=VSL G1=VSH1 G2=VSH1 G3=0
-	0x80, 0x40, 0x40, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT2 (red, R=1 BW=0): G0=VSL G1=VSH1 G2=0 G3=VSH2
-	0x80, 0x40, 0x00, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT3 (red, R=1 BW=1): same as LUT2
-	0x80, 0x40, 0x00, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT4 (VCOM): all DCVCOM
+// triLUT: no-clear tri-color refresh — directly applies target voltage
+// without clearing phases. Unchanged pixels get reinforced (no visible flash).
+// Used by refreshTriColor() with cmd 0x32 + 0xC7 (custom LUT, Mode 1).
+// OTP-loaded voltages from the initial 0xF7 persist and are reused.
+var triLUT = [153]byte{
+	// LUT0 (black, R=0 BW=0): G0=VSH1(black), G1=VSS
+	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT1 (white, R=0 BW=1): G0=VSL(white), G1=VSS
+	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT2 (red, R=1 BW=0): G0=VSL(clear BW to white), G1=VSH2(drive red)
+	0x80, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT3 (red, R=1 BW=1): G0=VSL(clear BW to white), G1=VSH2(drive red)
+	0x80, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT4 (VCOM): VSS
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// Group 0 (clear to black): TP=10, RP=0
+	// Group 0: TP[A]=10, RP=0 — clear BW residue / reinforce B/W pixels
 	10, 0, 0, 0, 0, 0, 0,
-	// Group 1 (clear to white): TP=10, RP=0
-	10, 0, 0, 0, 0, 0, 0,
-	// Group 2 (BW content): TP=20, RP=1 (2 reps)
-	20, 0, 0, 0, 0, 0, 1,
-	// Group 3 (Red content): TP=40, RP=2 (3 reps)
-	40, 0, 0, 0, 0, 0, 2,
-	// Groups 4-11: inactive
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// Group 1: TP[A]=30, RP=4 (5 reps) — drive red pigment saturation
+	30, 0, 0, 0, 0, 0, 4,
+	// Groups 2-11: inactive
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0,
 	// FR
-	0x33, 0x33, 0, 0, 0, 0,
+	0x33, 0, 0, 0, 0, 0,
 	// XON
 	0, 0, 0,
 }
 
-// diffLUT: 1 group — differential B/W transitions only, no clearing.
-// In Mode 2, the SSD1680 compares old and new RAM; only changed pixels are driven.
-// LUT0 = old0→new0 (same, no drive), LUT1 = 0→1 (VSH1→white),
-// LUT2 = 1→0 (VSL→black), LUT3 = old1→new1 (same, no drive).
+// diffLUT: 1 group — fast B/W refresh with reinforcement (Mode 1, 0xC7).
+// All pixels are driven to their target state on every refresh, preventing
+// fading of unchanged pixels. On this panel VSH1 drives black, VSL drives
+// white (reversed from datasheet naming — confirmed by OTP behaviour).
+// No voltage register writes needed — OTP-loaded voltages persist.
 var diffLUT = [153]byte{
-	// LUT0 (no change): all VSS
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT1 (black→white): G0=VSH1
+	// LUT0 (R=0 BW=0, black): reinforce with VSH1 — on this panel VSH1 drives black
 	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT2 (white→black): G0=VSL
+	// LUT1 (R=0 BW=1, white): reinforce with VSL — on this panel VSL drives white
 	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT3 (no change): all VSS
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT2 (R=1 BW=0): VSH1 (unused — no red pixels in B/W-only refresh)
+	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	// LUT3 (R=1 BW=1): VSL (unused — no red pixels in B/W-only refresh)
+	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	// LUT4 (VCOM): all DCVCOM
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	// Group 0: TP=10, RP=1 (2 reps)
@@ -86,18 +87,76 @@ var diffLUT = [153]byte{
 	0, 0, 0,
 }
 
-type EPD struct {
-	bus       drivers.SPI
-	cs        machine.Pin
-	dc        machine.Pin
-	rst       machine.Pin
-	busy      machine.Pin
-	buffer    [epdW / 8 * epdH]uint8 // black/white RAM
-	redBuffer [epdW / 8 * epdH]uint8 // red RAM
+// box represents a dirty rectangle in buffer coordinates.
+// bx0..bx1 = source byte columns (0–15), gy0..gy1 = gate rows (0–295).
+type box struct {
+	bx0, bx1 int16
+	gy0, gy1 int16
+	empty    bool
+}
 
-	DiffCount     int
+// diffBox scans two buffers and returns the tightest bounding box around all
+// bytes that differ. Returns box{empty: true} if the buffers are identical.
+func diffBox(a, b []byte) box {
+	r := box{empty: true, bx0: epdStride - 1, gy0: epdH - 1}
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			gy := int16(i / epdStride)
+			bx := int16(i % epdStride)
+			if r.empty {
+				r.empty = false
+				r.bx0, r.bx1 = bx, bx
+				r.gy0, r.gy1 = gy, gy
+			} else {
+				if bx < r.bx0 {
+					r.bx0 = bx
+				}
+				if bx > r.bx1 {
+					r.bx1 = bx
+				}
+				if gy < r.gy0 {
+					r.gy0 = gy
+				}
+				if gy > r.gy1 {
+					r.gy1 = gy
+				}
+			}
+		}
+	}
+	return r
+}
+
+// anyRedCleared returns true if any red pixel that was displayed has been
+// cleared in the current buffer. With redPixelClearsBit=false, a set bit = red;
+// "cleared" means a bit was 1 in disp but 0 in cur.
+func anyRedCleared(disp, cur []byte) bool {
+	for i := range disp {
+		if disp[i]&^cur[i] != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+type EPD struct {
+	bus  drivers.SPI
+	cs   machine.Pin
+	dc   machine.Pin
+	rst  machine.Pin
+	busy machine.Pin
+
+	buffer    [epdBufSz]uint8 // working B/W RAM (render target)
+	redBuffer [epdBufSz]uint8 // working red RAM (render target)
+
+	// Snapshot of what's actually on the display, used to compute pixel diffs.
+	dispBuffer    [epdBufSz]uint8
+	dispRedBuffer [epdBufSz]uint8
+
+	DiffCount     int    // partial refreshes since last full; auto-full at 8
 	LastRefreshMS int
 	LastTimeout   bool
+	LastTier      string // "full", "tri", "bw", "skip" — last refresh method
+	ForceFullNext bool // set true to force full OTP on next RefreshSmart
 }
 
 func NewEPD(bus drivers.SPI, cs, dc, rst, busy machine.Pin) EPD {
@@ -118,6 +177,263 @@ func (d *EPD) Configure() {
 	d.cmd(0x12) // software reset
 	time.Sleep(200 * time.Millisecond)
 
+	d.initRegisters()
+
+	for i := range d.buffer {
+		d.buffer[i] = 0xFF
+	}
+	for i := range d.redBuffer {
+		d.redBuffer[i] = 0x00
+	}
+
+	// Force full OTP refresh on first display to establish correct voltages
+	// and initialize the dispBuffer/dispRedBuffer baselines.
+	d.ForceFullNext = true
+}
+
+func (d *EPD) SetPixel(x, y int16, c color.RGBA) {
+	// Rotation: 270 degrees (landscape, 296x128)
+	x, y = y, epdH-1-x
+	if x < 0 || x >= epdW || y < 0 || y >= epdH {
+		return
+	}
+	idx := int(x/8) + int(y)*epdStride
+	bit := uint8(0x80) >> uint8(x%8)
+
+	isRed := c.R > 128 && c.G < 128 && c.B < 128
+
+	if isRed {
+		d.buffer[idx] |= bit
+		if redPixelClearsBit {
+			d.redBuffer[idx] &^= bit
+		} else {
+			d.redBuffer[idx] |= bit
+		}
+	} else if c.R == 0 && c.G == 0 && c.B == 0 {
+		d.buffer[idx] &^= bit
+		if redPixelClearsBit {
+			d.redBuffer[idx] |= bit
+		} else {
+			d.redBuffer[idx] &^= bit
+		}
+	} else {
+		d.buffer[idx] |= bit
+		if redPixelClearsBit {
+			d.redBuffer[idx] |= bit
+		} else {
+			d.redBuffer[idx] &^= bit
+		}
+	}
+}
+
+// Display does a full refresh (used by error/setup/calibration screens).
+func (d *EPD) Display() error {
+	return d.DisplayFull()
+}
+
+// DisplayFull writes both BW and Red buffers and does a full OTP refresh.
+// Always uses 0xF7 which loads OTP LUT AND populates VGH/VSH/VSL/VCOM
+// voltage registers from OTP — the voltages then persist for subsequent
+// partial refreshes that use custom LUTs. Never write 0x03/0x04/0x2C/0x3F
+// manually — that broke Attempts 2-4 by overriding the correct OTP values.
+func (d *EPD) DisplayFull() error {
+	d.wake()
+	d.setWindow(0, 0, epdW-1, epdH-1)
+	d.setPointerNoWait(0, 0)
+	time.Sleep(5 * time.Millisecond)
+
+	d.cmd(0x24)
+	d.dataBlock(d.buffer[:])
+
+	d.setPointerNoWait(0, 0)
+	d.cmd(0x26)
+	d.dataBlock(d.redBuffer[:])
+
+	d.cmd(0x22)
+	d.data(0xF7) // load temp + load OTP LUT + display Mode 1
+	d.cmd(0x20)
+
+	ms, timedOut := d.waitBusy(25000)
+
+	// After 0xF7 the controller is in standby. Wake it, then re-establish
+	// all control registers that the OTP may have modified.
+	d.wake()
+	d.initRegisters()
+
+	d.LastRefreshMS = ms
+	d.LastTimeout = timedOut
+	d.DiffCount = 0
+	d.ForceFullNext = false
+	d.LastTier = "full"
+
+	// Snapshot the displayed image for future diffs
+	copy(d.dispBuffer[:], d.buffer[:])
+	copy(d.dispRedBuffer[:], d.redBuffer[:])
+	return nil
+}
+
+// RefreshSmart compares the working buffers against the last-displayed
+// snapshot and picks the cheapest refresh tier:
+//   - nothing changed → skip
+//   - forced full / anti-ghost / red cleared → full-screen OTP (0xF7)
+//   - red pixels added → tri-color custom LUT (0xC7, no-clear, additive)
+//   - B/W only changed → fast partial (diffLUT + 0xCF, sub-second, no flicker)
+func (d *EPD) RefreshSmart() error {
+	bwBox := diffBox(d.buffer[:], d.dispBuffer[:])
+	redBox := diffBox(d.redBuffer[:], d.dispRedBuffer[:])
+
+	if bwBox.empty && redBox.empty {
+		d.LastTier = "skip"
+		return nil // nothing changed
+	}
+
+	// Red pixels were removed (e.g. usage dropped below 80% after a reset) —
+	// a no-clear tri-color pass can't erase red, so force a full OTP refresh.
+	if d.ForceFullNext || d.DiffCount >= 8 ||
+		anyRedCleared(d.dispRedBuffer[:], d.redBuffer[:]) {
+		return d.DisplayFull()
+	}
+
+	if !redBox.empty {
+		return d.refreshTriColor()
+	}
+
+	// B/W only — full-screen differential, flicker-free
+	return d.refreshPartialBW()
+}
+
+// refreshTriColor does a fast tri-color refresh using a custom no-clear LUT.
+// Writes full BW+red buffers and uses triLUT + 0xC7 (custom LUT, Mode 1).
+// No clearing phases — each pixel is directly driven to its target voltage,
+// so unchanged pixels don't flash. RAM is written once; the display update
+// is triggered 3 times to build up red pigment saturation (~9s total vs
+// ~15s for OTP). The OTP-loaded voltage registers persist from the initial
+// 0xF7 and are reused.
+func (d *EPD) refreshTriColor() error {
+	d.wake()
+	d.setWindow(0, 0, epdW-1, epdH-1)
+	d.setPointerNoWait(0, 0)
+	time.Sleep(5 * time.Millisecond)
+	d.cmd(0x24)
+	d.dataBlock(d.buffer[:])
+
+	d.setPointerNoWait(0, 0)
+	d.cmd(0x26)
+	d.dataBlock(d.redBuffer[:])
+
+	d.cmd(0x32)
+	d.dataBlock(triLUT[:])
+
+	totalMS := 0
+	timedOut := false
+	for pass := 0; pass < 3; pass++ {
+		d.cmd(0x22)
+		d.data(0xC7) // custom LUT + Mode 1 + display + power down
+		d.cmd(0x20)
+
+		ms, to := d.waitBusy(25000)
+		totalMS += ms
+		if to {
+			timedOut = true
+		}
+	}
+
+	d.LastRefreshMS = totalMS
+	d.LastTimeout = timedOut
+	d.DiffCount++
+	d.LastTier = "tri"
+
+	copy(d.dispBuffer[:], d.buffer[:])
+	copy(d.dispRedBuffer[:], d.redBuffer[:])
+	return nil
+}
+
+// refreshPartialBW does a full-screen Mode 1 refresh for B/W-only changes.
+// Uses diffLUT + 0xC7 (custom LUT, Mode 1) — the same mode as OTP and
+// refreshTriColor, avoiding Mode 2's controller-state sensitivity that
+// caused B/W inversion after OTP refreshes. Writes the NEW B/W frame to
+// 0x24 and the red buffer (all zeros for <80% usage) to 0x26. In Mode 1,
+// LUT0 (R=0,BW=0)→VSL→black and LUT1 (R=0,BW=1)→VSH1→white. All pixels
+// are driven to their target state (reinforcement prevents fading).
+func (d *EPD) refreshPartialBW() error {
+	d.wake()
+	d.setWindow(0, 0, epdW-1, epdH-1)
+
+	d.setPointerNoWait(0, 0)
+	time.Sleep(5 * time.Millisecond)
+	d.cmd(0x24)
+	d.dataBlock(d.buffer[:])
+
+	d.setPointerNoWait(0, 0)
+	d.cmd(0x26)
+	d.dataBlock(d.redBuffer[:])
+
+	d.cmd(0x32)
+	d.dataBlock(diffLUT[:])
+
+	totalMS := 0
+	timedOut := false
+	for pass := 0; pass < 5; pass++ {
+		d.cmd(0x22)
+		d.data(0xC7) // custom LUT + Mode 1 + display + power down
+		d.cmd(0x20)
+
+		ms, to := d.waitBusy(25000)
+		totalMS += ms
+		if to {
+			timedOut = true
+		}
+	}
+
+	d.LastRefreshMS = totalMS
+	d.LastTimeout = timedOut
+	d.DiffCount++
+	d.LastTier = "bw"
+
+	copy(d.dispBuffer[:], d.buffer[:])
+	copy(d.dispRedBuffer[:], d.redBuffer[:])
+	return nil
+}
+
+func (d *EPD) ClearBuffer() {
+	for i := range d.buffer {
+		d.buffer[i] = 0xFF
+	}
+	for i := range d.redBuffer {
+		d.redBuffer[i] = 0x00
+	}
+}
+
+// FillBlack fills the BW buffer with all black and red buffer with no-red.
+func (d *EPD) FillBlack() {
+	for i := range d.buffer {
+		d.buffer[i] = 0x00
+	}
+	for i := range d.redBuffer {
+		d.redBuffer[i] = 0x00
+	}
+}
+
+func (d *EPD) Size() (int16, int16) {
+	return epdH, epdW // rotated: 296x128
+}
+
+// wake brings the controller out of standby. Every refresh sequence
+// (0xF7/0xCF/0xC7) ends by disabling clock+analog, leaving the SSD1680 in
+// standby where register and RAM writes are silently ignored. This must be
+// called before any SPI writes that follow a completed refresh.
+func (d *EPD) wake() {
+	d.cmd(0x22)
+	d.data(0xC0) // enable clock + analog
+	d.cmd(0x20)
+	d.waitBusy(1000)
+}
+
+// initRegisters sets all non-volatile control registers to known values.
+// Called by Configure() at boot and by DisplayFull() after each OTP refresh,
+// since 0xF7 may modify registers beyond cmd 0x21. Voltage registers
+// (0x03/0x04/0x2C) are NOT touched — they persist from the OTP load.
+func (d *EPD) initRegisters() {
 	d.cmd(0x01) // driver output control
 	d.data(0x27) // (296-1) & 0xFF
 	d.data(0x01) // (296-1) >> 8
@@ -139,162 +455,6 @@ func (d *EPD) Configure() {
 	d.setWindow(0, 0, epdW-1, epdH-1)
 	d.setPointerNoWait(0, 0)
 	time.Sleep(50 * time.Millisecond)
-
-	for i := range d.buffer {
-		d.buffer[i] = 0xFF
-	}
-	for i := range d.redBuffer {
-		d.redBuffer[i] = 0x00
-	}
-
-	// No custom LUT written here — DisplayFull() uses OTP (0xF7),
-	// DisplayDiff() writes diffLUT + voltage registers before each call.
-}
-
-func (d *EPD) SetPixel(x, y int16, c color.RGBA) {
-	// Rotation: 270 degrees (landscape, 296x128)
-	x, y = y, epdH-1-x
-	if x < 0 || x >= epdW || y < 0 || y >= epdH {
-		return
-	}
-	idx := int(x/8) + int(y)*(epdW/8)
-	bit := uint8(0x80) >> uint8(x%8)
-
-	isRed := c.R > 128 && c.G < 128 && c.B < 128
-
-	if isRed {
-		// Red pixel: BW = white (set bit), Red = mark red
-		d.buffer[idx] |= bit
-		if redPixelClearsBit {
-			d.redBuffer[idx] &^= bit // clear bit = red
-		} else {
-			d.redBuffer[idx] |= bit // set bit = red
-		}
-	} else if c.R == 0 && c.G == 0 && c.B == 0 {
-		// Black pixel: BW = black (clear bit), Red = no red
-		d.buffer[idx] &^= bit
-		if redPixelClearsBit {
-			d.redBuffer[idx] |= bit // set bit = no red
-		} else {
-			d.redBuffer[idx] &^= bit // clear bit = no red
-		}
-	} else {
-		// White pixel: BW = white (set bit), Red = no red
-		d.buffer[idx] |= bit
-		if redPixelClearsBit {
-			d.redBuffer[idx] |= bit // set bit = no red
-		} else {
-			d.redBuffer[idx] &^= bit // clear bit = no red
-		}
-	}
-}
-
-// Display does a full refresh (used by error/setup/calibration screens).
-func (d *EPD) Display() error {
-	return d.DisplayFull()
-}
-
-// DisplayFull writes both BW and Red buffers and does a full OTP refresh with
-// proper clearing phases. Always uses 0xF7 (load temp + OTP LUT + display) —
-// the OTP waveform is the only reliable way to drive red and do a proper clear.
-func (d *EPD) DisplayFull() error {
-	d.setWindow(0, 0, epdW-1, epdH-1)
-	d.setPointerNoWait(0, 0)
-	time.Sleep(5 * time.Millisecond)
-
-	d.cmd(0x24)
-	d.dataBlock(d.buffer[:])
-
-	d.setPointerNoWait(0, 0)
-	d.cmd(0x26)
-	d.dataBlock(d.redBuffer[:])
-
-	// Always use OTP for full refresh — custom LUT voltage values are
-	// panel-specific and ours aren't calibrated. OTP is reliable.
-	d.cmd(0x22)
-	d.data(0xF7) // load temp + load OTP LUT + display Mode 1
-	d.cmd(0x20)
-
-	ms, timedOut := d.waitBusy(25000)
-	d.LastRefreshMS = ms
-	d.LastTimeout = timedOut
-	d.DiffCount = 0
-	return nil
-}
-
-// DisplayDiff writes only the BW buffer and uses Mode 2 (differential) so the
-// SSD1680 compares old and new RAM and only drives pixels that changed.
-// Unchanged pixels don't flash at all. Red RAM is untouched — red stays visible.
-func (d *EPD) DisplayDiff() error {
-	if !useFastRefresh {
-		return d.DisplayFull()
-	}
-
-	// Write voltage registers + custom diffLUT. The preceding DisplayFull()
-	// used 0xF7 which loaded OTP values — we must overwrite with our own.
-	d.cmd(0x03)
-	d.data(0x17) // VGH = 20V
-	d.cmd(0x04)
-	d.data(0x41) // VSH1
-	d.data(0xAE) // VSH2
-	d.data(0x32) // VSL
-	d.cmd(0x2C)
-	d.data(0x36) // VCOM
-	d.cmd(0x3F)
-	d.data(0x22) // EOPT
-	d.cmd(0x32)
-	d.dataBlock(diffLUT[:])
-
-	d.setWindow(0, 0, epdW-1, epdH-1)
-	d.setPointerNoWait(0, 0)
-	time.Sleep(5 * time.Millisecond)
-
-	d.cmd(0x24)
-	d.dataBlock(d.buffer[:])
-	// Red RAM (0x26) intentionally NOT written — red pixels stay from last full refresh
-
-	d.cmd(0x22)
-	d.data(0xCF) // custom LUT + Mode 2 (differential)
-	d.cmd(0x20)
-
-	ms, timedOut := d.waitBusy(25000)
-	d.LastRefreshMS = ms
-	d.LastTimeout = timedOut
-	d.DiffCount++
-	return nil
-}
-
-func (d *EPD) ClearDisplay() {
-	d.ClearBuffer()
-	d.DisplayFull()
-}
-
-func (d *EPD) ClearBuffer() {
-	for i := range d.buffer {
-		d.buffer[i] = 0xFF
-	}
-	for i := range d.redBuffer {
-		d.redBuffer[i] = 0x00 // no red
-	}
-}
-
-// FillBlack fills the BW buffer with all black and red buffer with no-red.
-func (d *EPD) FillBlack() {
-	for i := range d.buffer {
-		d.buffer[i] = 0x00 // all black
-	}
-	for i := range d.redBuffer {
-		d.redBuffer[i] = 0x00 // no red
-	}
-}
-
-func (d *EPD) Size() (int16, int16) {
-	return epdH, epdW // rotated: 296x128
-}
-
-// BusyNow returns the current level of the BUSY pin (true=HIGH=busy).
-func (d *EPD) BusyNow() bool {
-	return d.busy.Get()
 }
 
 func (d *EPD) setWindow(xStart, yStart, xEnd, yEnd int16) {
@@ -306,15 +466,6 @@ func (d *EPD) setWindow(xStart, yStart, xEnd, yEnd int16) {
 	d.data(uint8(yStart >> 8))
 	d.data(uint8(yEnd & 0xFF))
 	d.data(uint8(yEnd >> 8))
-}
-
-func (d *EPD) setPointer(x, y int16) {
-	d.cmd(0x4E)
-	d.data(uint8(x / 8))
-	d.cmd(0x4F)
-	d.data(uint8(y & 0xFF))
-	d.data(uint8(y >> 8))
-	d.waitBusy(3000)
 }
 
 func (d *EPD) setPointerNoWait(x, y int16) {

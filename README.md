@@ -6,17 +6,17 @@ A physical e-ink display that shows your Claude Pro rate-limit usage in real tim
 ┌──────────────────────────────────────────┐
 │ CLAUDE PRO                               │
 │ ─────────────────────────────────────    │
-│ 5-HOUR                   Resets 2h 14m   │
-│ ▕█████████████         ▏ 48%     (RED)   │
+│ 5-HOUR                         14:30     │
+│ ▕█████████████         ▏ 48%             │
 │ 1.2M / 3.2M tokens                       │
 │ - - - - - - - - - - - - - - - - - - - -  │
-│ WEEKLY                   Resets 4d 11h   │
-│ ▕██████████████████    ▏ 72%     (BLACK) │
+│ WEEKLY                   Wed 14:30       │
+│ ▕██████████████████████▏ 85%             │
 │ 18.4M / 25.6M tokens                     │
 └──────────────────────────────────────────┘
 ```
 
-The 5-hour window renders in **red** and the weekly window in **black**, using the tri-color e-ink display's native red channel.
+Both sections render in **black** by default. When a section's usage reaches **≥80%**, its progress bar and title turn **red** using the tri-color e-ink display's native red channel. The percentage, reset time, and token stats always stay black for fast partial refresh.
 
 ## Hardware
 
@@ -25,21 +25,12 @@ The 5-hour window renders in **red** and the weekly window in **black**, using t
 
 ### Wiring
 
-| Display Pin | nice!nano Pin |
-|-------------|---------------|
-| DIN (MOSI)  | P0.24         |
-| CLK (SCK)   | P0.22         |
-| CS          | P0.06         |
-| DC          | P0.08         |
-| RST         | P0.17         |
-| BUSY        | P0.20         |
-
   ┌─────────────┬───────────────────────┐
   │ E-Paper Pin │     nice!nano Pin     │
   ├─────────────┼───────────────────────┤
-  │ SDA         │ P0.24 (D5) — SPI MOSI │
+  │ SDA / DIN   │ P0.24 (D5) — SPI MOSI │
   ├─────────────┼───────────────────────┤
-  │ SCL         │ P0.22 (D4) — SPI SCK  │
+  │ SCL / CLK   │ P0.22 (D4) — SPI SCK  │
   ├─────────────┼───────────────────────┤
   │ CS          │ P0.06 (D1)            │
   ├─────────────┼───────────────────────┤
@@ -89,20 +80,20 @@ That's it. `clue` reads your Claude credentials automatically and starts pushing
 
 ## Using clue
 
-`clue` (**cl**aude **u**sage **e**-ink) is the host-side daemon that polls the Claude API and sends rate-limit data to the device over USB serial.
+`clue` (**cl**aude **u**sage **e**-ink) is the host-side daemon that polls the Claude API and sends rate-limit data to the device over USB serial. It is resilient to USB disconnect/reconnect — if the nice!nano is unplugged, `clue` detects the serial I/O error, closes the port, and waits for the device to reappear. No restart needed.
 
 ### How authentication works
 
 `clue` reads OAuth credentials from `~/.claude/.credentials.json` — the same file that [Claude Code](https://claude.ai/code) writes when you log in. No API keys, no manual token setup. If you're logged into Claude Code, `clue` just works.
 
-If the token has expired, `clue` will tell you:
+If the token has expired, `clue` will tell you — both in the terminal and on the e-ink display:
 
 ```
 Access token expired at 2026-06-19T18:27:11+02:00.
 Run 'claude' to refresh.
 ```
 
-Just open Claude Code to refresh the token, then restart `clue`.
+The display shows "Token Expired or Revoked" / "Run 'claude' to re-authenticate" in black text (fast refresh, no red ink). Just open Claude Code to refresh the token, then restart `clue`.
 
 ### Flags
 
@@ -126,7 +117,7 @@ Just open Claude Code to refresh the token, then restart `clue`.
 
 ### Running as a systemd service
 
-To keep `clue` running in the background:
+`clue` is designed to run as a long-lived daemon — it handles USB disconnect/reconnect gracefully and shows errors on the display (so you don't need to watch the terminal). To run it in the background:
 
 ```ini
 # ~/.config/systemd/user/clue.service

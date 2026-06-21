@@ -40,12 +40,15 @@ Newline-delimited ASCII messages between device and host:
 | Host→Device | `E` | Auth error — token expired |
 | Host→Device | `F` | Force full OTP refresh with current data |
 | Host→Device | `G` | Request token/status |
+| Host→Device | `M:0\|1\|2` | Set B/W partial mode: 0=OTP 0xFF, 1=diffLUT 0xCF, 2=full OTP fallback |
+| Host→Device | `P` | Test partial refresh with current data |
 
 Reset fields: `h5resetMin` = minute-of-day (0-1439, or -1), `w1resetDay` = weekday (0=Sun..6=Sat, or -1), `w1resetMin` = minute-of-day. The host computes these from the API's RFC3339 reset timestamps and sends absolute local clock times so the firmware doesn't need an RTC.
 
 ## Host Daemon (`./clue`)
 
 - Waits for serial device to appear (polls every 2s) — can be started before plugging in the nice!nano
+- Resilient to USB disconnect/reconnect: detects serial I/O errors, closes the port, and loops back to device detection. Designed to run as a long-lived systemd service
 - Polls API every 30s, only sends data when usage actually changes
 - Nightly 4am full OTP refresh (`F` command) to clear e-ink ghosting
 - Reset time log lines only printed when the 5h reset time changes
@@ -59,9 +62,18 @@ Reset fields: `h5resetMin` = minute-of-day (0-1439, or -1), `w1resetDay` = weekd
 - **BUSY polarity**: HIGH = busy, LOW = ready
 - Landscape via 270° rotation. Dual RAM: black/white (cmd 0x24) + red (cmd 0x26)
 - Red polarity: `redPixelClearsBit = false` (set bit = red pixel). Red buffer inits to 0x00
-- 5-hour section in **red**, weekly in **black**; progress bars + big 2×-scaled digit glyphs
-- Two refresh modes: `DisplayFull()` (OTP, 0xF7) and `DisplayDiff()` (custom LUT, 0xCF)
-- Display only refreshes when usage data actually changes; differential mode when only B/W content changed
+- **Threshold-driven red**: both sections default to **black**; bar+title turn **red** at **≥80%** usage. Big %, reset time, and token stats always stay black (they change frequently — keeping them B/W enables fast partial refresh). Red pixels only grow (title switches black→red once; bar fill adds red as it grows). When usage drops below 80% (reset), red must be cleared via a full OTP refresh — `RefreshSmart` detects this automatically via `anyRedCleared()`. Progress bars + big 2×-scaled digit glyphs
+- **CRITICAL — Reversed voltage polarity on this panel**: on the GDEY029Z94, **VSH1 drives BLACK** and **VSL drives WHITE** — the reverse of the SSD1680 datasheet naming convention (which says VSH1 = "source high" and VSL = "source low"). The OTP waveform is calibrated for this panel and produces correct output. **All custom LUTs must use VSH1 (01) for black and VSL (10) for white.** VSH2 (11) drives red as expected. Getting this wrong causes B/W inversion — this was the root cause of every B/W inversion bug we encountered. Never assume VSH1=white, VSL=black from the datasheet — verify against the OTP's behaviour on the actual panel
+- **Smart refresh engine** with pixel-level diffing (CLUE-FW-19):
+  - `RefreshSmart()` compares working buffers against last-displayed snapshot, picks cheapest tier
+  - Full-screen OTP (`0xF7`) for init / 4am / every 8 partials (anti-ghost) / red pixel removal
+  - Tri-color custom LUT (`triLUT` + `0xC7`, Mode 1, 2-group, 3-pass) when red pixels are added — Group 0 clears BW residue with VSL (white), Group 1 drives VSH2 (red) for saturation
+  - Fast B/W refresh (`diffLUT` + `0xC7`, Mode 1, 5-pass) for B/W-only changes — all pixels reinforced to prevent fading
+  - Pixel diff skips refresh entirely when nothing changed
+- **All custom refreshes use Mode 1 (`0xC7`)** — Mode 2 (`0xCF`, differential) was abandoned because its LUT index mapping depends on controller state that the OTP modifies unpredictably, causing B/W inversion on the first custom refresh after any 0xF7
+- **Controller standby**: every refresh sequence (0xF7/0xC7) ends by disabling clock+analog. All refresh functions call `wake()` (0xC0 + master activation) before SPI writes. `DisplayFull` also calls `initRegisters()` after OTP to reset any registers the OTP modified
+- **Critical voltage register insight**: the SSD1680 automatically loads VGH/VSH/VSL/VCOM from OTP during any 0xF7 refresh. These values persist in the registers. Custom LUTs (cmd 0x32 + 0xC7) reuse them — **never write 0x03/0x04/0x2C/0x3F manually**
+- **Error display**: auth errors (`E` command) render in black-only text ("Token Expired or Revoked" / "Run 'claude' to re-authenticate") via `RefreshSmart()` — fast B/W partial, no red ink, no full OTP needed
 
 ## Flash Token Storage
 
@@ -171,8 +183,10 @@ Separate voltage registers (NOT part of cmd 0x32, must be set independently):
 
 ### LUT mapping — differential (Mode 2)
 
-| Old BW | New BW | Transition | LUT |
-|--------|--------|------------|-----|
+On this panel, the LUT index is `(0x24 << 1) | 0x26` — **0x24 is the "old" frame, 0x26 is the "new" frame**. (Many SSD1680 documents list the reverse assignment; the correct one was derived from observed panel behaviour.)
+
+| 0x24 (old) | 0x26 (new) | Transition | LUT |
+|------------|------------|------------|-----|
 | 0 | 0 | Same (B→B) | LUT0 |
 | 0 | 1 | Black→White | LUT1 |
 | 1 | 0 | White→Black | LUT2 |
@@ -208,46 +222,51 @@ Spoofing the temperature register (cmd 0x1A) selects a different band.
 
 **Result**: Display showed **inverted B/W** (background black, text white) and **no clearing** (old content not erased). Adding clearing phases to the LUT made NO difference — the display behaved identically regardless of LUT content.
 
-**Root cause**: The voltage registers (0x03 VGH, 0x04 VSH1/VSH2/VSL, 0x2C VCOM) were NOT populated. The LUT's VS values (01=VSH1, 10=VSL, 11=VSH2) are REFERENCES to voltages generated by the analog block. Without setting these registers, the source driver has no voltages to apply. The 0xB1 OTP preload likely didn't populate them because it doesn't enable the analog block (B6=0 in 0xB1).
+**Root cause**: No prior 0xF7 refresh had run to populate the voltage registers from OTP. The LUT's VS values (01=VSH1, 10=VSL, 11=VSH2) are REFERENCES to voltages generated by the analog block. Without those registers populated, the source driver has no voltages to apply.
 
-**Critical lesson**: **cmd 0x32 DOES write the live LUT register** (confirmed by Adafruit CircuitPython, Zephyr ssd16xx, NuttX). But the LUT alone is useless — you MUST also set 0x03, 0x04, 0x2C, and 0x3F alongside it. The Adafruit driver always writes these explicitly when using custom LUTs.
+**Critical lesson**: **cmd 0x32 DOES write the live LUT register** (confirmed by Adafruit, Zephyr, NuttX). The actual fix is simpler than we thought: run one 0xF7 refresh first (which auto-loads OTP voltages), then use custom LUTs freely — the voltage registers persist. **Never write 0x03/0x04/0x2C/0x3F manually** — the Adafruit values (0x41/0xAE/0x32) are for a different panel and caused the inversions in Attempts 3-4.
 
-**Adafruit-confirmed voltage values**: `0x03→0x17`, `0x04→0x41,0xAE,0x32`, `0x2C→0x36`, `0x3F→0x22`.
+### Attempt 3: Custom LUT WITH Adafruit Voltage Registers (FAILED — ROOT CAUSE FOUND)
 
-### Attempt 3: Custom LUT WITH Voltage Registers (NOT YET VERIFIED)
+**Approach**: Write Adafruit voltage registers (`0x03→0x17`, `0x04→0x41,0xAE,0x32`, `0x2C→0x36`, `0x3F→0x22`) + custom LUT + 0xC7.
 
-**Approach**: Write voltage registers explicitly + custom LUT + 0xC7. This is the `fullLUT` currently in `epd.go`.
+**Result**: Inverted B/W, no proper clearing. Same symptoms as Attempt 2.
 
-**Status**: Code is in the firmware but DisplayFull() currently uses 0xF7 (OTP) as a reliability fallback. The custom fullLUT + voltage registers + 0xC7 path has NOT been tested on hardware yet. If someone wants to try it, change `DisplayFull()` to use 0xC7 instead of 0xF7 and ensure the voltage registers + fullLUT are written before the display command.
+**Root cause (resolved June 2026)**: The Adafruit voltage values are for a DIFFERENT panel (Adafruit 2.9" SSD1680). Our WeAct/GDEY029Z94 panel needs its own OTP-calibrated voltages. **Writing any voltage registers at all was the mistake** — it overwrote the correct OTP values that 0xF7 had loaded. GxEPD2's SSD1680 drivers **never** write 0x03/0x04/0x2C, confirming this is the correct approach.
 
-**Risk**: The voltage values (0x41/0xAE/0x32) are from Adafruit and may not be correct for the WeAct/GDEY029Z94 panel. Wrong voltages could produce weak colors or no display output.
+### Attempt 5: Smart Refresh Engine (CLUE-FW-19 — CURRENT)
 
-### Attempt 4: Differential Mode 2 with diffLUT (NOT YET VERIFIED)
+**Approach**: Run one 0xF7 at init (loads correct OTP voltages into registers), then never write voltage registers again. Custom LUTs via cmd 0x32 reuse the persisted OTP voltages. Pixel-level diffing selects the cheapest refresh tier. `DisplayFull` re-sends cmd 0x21 `{0x00, 0x80}` after OTP completes to restore B/W polarity; `refreshTriColor` re-sends it before each pass.
 
-**Approach**: After a full OTP refresh (0xF7) establishes the displayed image, subsequent updates write only the B/W buffer (skip red RAM) + diffLUT + 0xCF (Mode 2 differential, custom LUT). Only changed pixels get driven — unchanged pixels don't flash.
+**Key insight**: The SSD1680 voltage registers persist between refreshes. A 0xF7 refresh auto-loads them from OTP. Subsequent custom LUT operations reference the same correct voltages — no manual writes needed. This is how GxEPD2 (mono partial) works: OTP loads voltages, then `0xFC` (OTP Mode 2) reuses them.
 
-**Status**: Code is in firmware (`DisplayDiff()`) but the differential path depends on the custom LUT working (Attempt 3). If the custom LUT + voltage registers work, this should give near-instant B/W-only updates with zero flashing on unchanged pixels.
+**B/W partial flow** (Mode 2, full-screen): write OLD B/W (`dispBuffer`) to **0x24** and NEW B/W (`buffer`) to **0x26**, trigger with 0xCF. On this panel `0x24` is the "old"/high bit and `0x26` the "new"/low bit for Mode 2 LUT selection (the reverse of what many SSD1680 docs state — confirmed by panel behaviour). Unchanged pixels map to LUT0/LUT3 = VSS (no drive, no flicker). Both full buffers are written each time (~19ms SPI overhead at 4MHz) to avoid stale RAM outside a dirty window. Sub-second total.
 
-**Limitation**: Red content can NOT be updated via differential mode. Red particles require full clearing cycles. When the 5-hour section changes, `DisplayFull()` is used instead.
+**Red/tri-color flow** (Mode 1, 3-pass): write full BW+red to 0x24/0x26, then trigger `triLUT` + 0xC7 three times to build up red pigment saturation (~9s total). Each pass reinforces existing red pixels and establishes new ones. Red is additive-only between resets — the no-clear LUT never erases red.
 
-### Current State
+**Red removal**: When usage drops below 80% at reset, red pixels need clearing. `anyRedCleared()` detects bits that were set in the displayed red buffer but cleared in the new one. `RefreshSmart` forces a full OTP refresh in this case — only a 0xF7 can reliably erase red.
 
-- `DisplayFull()` uses **0xF7 (OTP)** — reliable, correct colors, proper clearing, ~15s with ~15 flashing cycles
-- `DisplayDiff()` uses **0xCF + diffLUT + voltage registers** — untested, should give fast B/W-only updates
-- Smart selection in `handleMessage`: full refresh for first display / red changes / every 10 diffs; differential for B/W-only changes
+**Debug harness**: `M:0` (OTP 0xFF), `M:1` (diffLUT 0xCF, default), `M:2` (full OTP) — switch via serial without reflashing.
+
+### Current State (CLUE-FW-19)
+
+- `DisplayFull()` uses **0xF7 (OTP)** — reliable, correct colors, auto-loads voltage registers. Re-sends cmd 0x21 `{0x00, 0x80}` after OTP completes to restore B/W polarity
+- `RefreshSmart()` picks the cheapest tier via pixel-level diffing:
+  - Full-screen OTP for init / 4am / every 8 partials / red pixel removal (`anyRedCleared()`)
+  - Tri-color custom LUT (`triLUT` + `0xC7`, 3-pass) for additive red changes (~9s)
+  - Full-screen differential (`diffLUT` + `0xCF`, OLD→0x24, NEW→0x26) for B/W-only changes — sub-second, no flicker, **no voltage register writes**
+  - Skip when nothing changed
+- `M:0|1|2` serial command switches B/W partial mode without reflashing
 - Nightly 4am forced full refresh via `F` serial command
+- Error screen (`E` command) renders in black-only via `RefreshSmart()` — fast B/W partial
 
 ### What to Try Next
 
-1. **Verify Attempt 3**: Change `DisplayFull()` to write fullLUT + voltage registers + 0xC7 instead of 0xF7. If colors are correct, this cuts full refresh from ~15 phases to 4. If inverted/blank, the voltage values need calibration for this specific panel.
+1. **Read OTP voltage values**: Use cmd 0x2D after an OTP load to read back the panel's actual VGH/VSH1/VSH2/VSL/VCOM. Could enable a custom `fullLUT` + `0xC7` for faster full refreshes (cutting ~15s to ~2-4s).
 
-2. **Read OTP voltage values**: Use cmd 0x2D (OTP Register Read for Display Option) after an OTP load (0xF7) to read back the panel's actual VGH/VSH1/VSH2/VSL/VCOM values. Use these instead of Adafruit's values.
+2. **Optimize the 4am/init full refresh**: Once the correct OTP voltages are known, write a custom `fullLUT` with fewer groups and use `0xC7` (no OTP reload). Gate behind `M:` harness.
 
-3. **Verify Attempt 4**: Once Attempt 3 works, test `DisplayDiff()` — should only flash changed B/W pixels.
-
-4. **Waveshare Display_Base + Display_Partial**: Instead of custom LUT, try Waveshare's proven approach: `Display_Base` (0xF4) to establish reference, then `Display_Partial` (0x1C, writes only 0x24, OTP partial LUT). This uses OTP waveforms for both full and partial, avoiding custom voltage calibration.
-
-5. **RAM Ping-Pong**: Enable via cmd 0x37 byte 5 = 0x40. May be needed for differential Mode 2 to properly compare old and new RAM banks.
+3. **Tune tri-color pass count**: The 3-pass `refreshTriColor` builds adequate red saturation in ~9s. With known OTP voltages, a stronger single-pass LUT might achieve the same result faster.
 
 ### Sources
 

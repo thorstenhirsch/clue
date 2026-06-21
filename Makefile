@@ -1,4 +1,4 @@
-.PHONY: all firmware flash clue clean
+.PHONY: all firmware flash clue clue-test clean
 
 all: firmware clue
 
@@ -11,5 +11,8 @@ flash:
 clue:
 	go build -o clue ./cmd/clue/
 
+clue-test:
+	go build -o clue-test ./cmd/clue-test/
+
 clean:
-	rm -f clue.uf2 clue
+	rm -f clue.uf2 clue clue-test

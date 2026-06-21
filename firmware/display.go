@@ -57,17 +57,23 @@ type UsageData struct {
 	W1ResetMin int64 // minutes-of-day 0–1439, or -1 = unknown
 }
 
-func usageChanged(a, b *UsageData) bool {
-	return a.H5Used != b.H5Used ||
-		a.H5Limit != b.H5Limit ||
-		a.W1Used != b.W1Used ||
-		a.W1Limit != b.W1Limit
+// barTurnsRed returns true if any section's bar switches from black (<80%)
+// to red (≥80%). A no-clear tri-color refresh can't transition black→red —
+// the caller should force a full OTP refresh instead.
+func barTurnsRed(old, cur *UsageData) bool {
+	return pct(old.H5Used, old.H5Limit) < 80 && pct(cur.H5Used, cur.H5Limit) >= 80 ||
+		pct(old.W1Used, old.W1Limit) < 80 && pct(cur.W1Used, cur.W1Limit) >= 80
 }
 
-func redContentChanged(a, b *UsageData) bool {
-	return a.H5Used != b.H5Used ||
-		a.H5Limit != b.H5Limit ||
-		a.H5ResetMin != b.H5ResetMin
+func pct(used, limit int64) int64 {
+	if limit <= 0 {
+		return 0
+	}
+	p := (used * 100) / limit
+	if p > 100 {
+		return 100
+	}
+	return p
 }
 
 func renderUsageScreen(d *EPD, u *UsageData) {
@@ -77,22 +83,22 @@ func renderUsageScreen(d *EPD, u *UsageData) {
 	tinyfont.WriteLine(d, font, marginX, 12, "CLAUDE PRO", black)
 	tinydraw.FilledRectangle(d, marginX, 16, screenW-2*marginX, 2, black)
 
-	// 5-hour section in RED — reset as "HH:MM"
+	// 5-hour section — reset as "HH:MM"
 	h5reset := formatClock(u.H5ResetMin)
-	drawSection(d, 26, "5-HOUR", u.H5Used, u.H5Limit, h5reset, red)
+	drawSection(d, 29, "5-HOUR", u.H5Used, u.H5Limit, h5reset)
 
 	// Divider
-	drawDashedLine(d, marginX, 66, screenW-marginX)
+	drawDashedLine(d, marginX, 73, screenW-marginX)
 
-	// Weekly section in BLACK — reset as "Ddd HH:MM"
+	// Weekly section — reset as "Ddd HH:MM"
 	w1reset := ""
 	if u.W1ResetDay >= 0 && u.W1ResetMin >= 0 {
 		w1reset = weekdayAbbrev(u.W1ResetDay) + " " + formatClock(u.W1ResetMin)
 	}
-	drawSection(d, 74, "WEEKLY", u.W1Used, u.W1Limit, w1reset, black)
+	drawSection(d, 84, "WEEKLY", u.W1Used, u.W1Limit, w1reset)
 }
 
-func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLabel string, col color.RGBA) {
+func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLabel string) {
 	pct := int64(0)
 	if limit > 0 {
 		pct = (used * 100) / limit
@@ -101,11 +107,18 @@ func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLab
 		pct = 100
 	}
 
+	// Bar+title turn red at ≥80% usage. Big %, reset time, and token stats
+	// always stay black so they can update via fast B/W partial refresh.
+	barCol := black
+	if pct >= 80 {
+		barCol = red
+	}
+
 	// Label (left) and reset time (right)
-	tinyfont.WriteLine(d, font, marginX, labelY, label, col)
+	tinyfont.WriteLine(d, font, marginX, labelY, label, barCol)
 	if resetLabel != "" {
 		resetW := int16(len(resetLabel)) * 6
-		tinyfont.WriteLine(d, font, screenW-marginX-resetW, labelY, resetLabel, col)
+		tinyfont.WriteLine(d, font, screenW-marginX-resetW, labelY, resetLabel, black)
 	}
 
 	// Progress bar: outlined frame + solid fill
@@ -114,21 +127,21 @@ func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLab
 	fillW := int16((int64(barW) * pct) / 100)
 
 	// Outer frame
-	tinydraw.Rectangle(d, barX, barY, int16(barW), int16(barH), col)
+	tinydraw.Rectangle(d, barX, barY, int16(barW), int16(barH), barCol)
 
 	// Filled portion (inset by 1px so fill is inside the frame)
 	if fillW > 2 {
-		tinydraw.FilledRectangle(d, barX+1, barY+1, fillW-2, int16(barH)-2, col)
+		tinydraw.FilledRectangle(d, barX+1, barY+1, fillW-2, int16(barH)-2, barCol)
 	}
 
 	// Big used-% number to the right of the bar
 	pctX := barX + int16(barW) + 6
 	pctY := barY + (int16(barH)-int16(digitH))/2
-	drawBigPercent(d, pctX, pctY, pct, col)
+	drawBigPercent(d, pctX, pctY, pct, black)
 
 	// Token detail line below bar
 	detailY := barY + barH + 8
-	tinyfont.WriteLine(d, font, marginX, detailY, formatTokens(used)+" / "+formatTokens(limit)+" tokens", col)
+	tinyfont.WriteLine(d, font, marginX, detailY, formatTokens(used)+" / "+formatTokens(limit)+" tokens", black)
 }
 
 func drawBigPercent(d *EPD, x, y int16, value int64, col color.RGBA) {
@@ -163,11 +176,9 @@ func drawBigGlyph(d *EPD, x, y int16, idx int, col color.RGBA) {
 
 func renderErrorScreen(d *EPD) {
 	d.ClearBuffer()
-	tinyfont.WriteLine(d, font, marginX, 35, "ERROR", red)
-	tinydraw.FilledRectangle(d, marginX, 39, 30, 2, red)
-	tinyfont.WriteLine(d, font, marginX, 58, "Token expired!", black)
-	tinyfont.WriteLine(d, font, marginX, 80, "Run 'claude' to refresh,", black)
-	tinyfont.WriteLine(d, font, marginX, 96, "then restart clue.", black)
+	tinyfont.WriteLine(d, font, marginX, 50, "Token Expired or Revoked", black)
+	tinydraw.FilledRectangle(d, marginX, 54, 144, 2, black)
+	tinyfont.WriteLine(d, font, marginX, 74, "Run 'claude' to re-authenticate", black)
 }
 
 func renderSetupScreen(d *EPD) {

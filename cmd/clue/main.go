@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"log"
@@ -21,115 +20,189 @@ func main() {
 	intervalFlag := flag.Duration("interval", 30*time.Second, "polling interval")
 	flag.Parse()
 
-	creds, err := claude.LoadCredentials()
-	if err != nil {
+	if _, err := claude.LoadCredentials(); err != nil {
 		log.Fatalf("Failed to load credentials: %v\nRun 'claude' to authenticate first.", err)
 	}
-	if creds.Expired() {
-		log.Fatalf("Access token expired at %s.\nRun 'claude' to refresh.", creds.ExpiresAt.Format(time.RFC3339))
-	}
-	log.Printf("Loaded %s credentials (expires %s)", creds.SubscriptionType, creds.ExpiresAt.Format(time.RFC3339))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	portName := *portFlag
-	if portName == "" {
-		log.Println("Waiting for device...")
-		for {
-			select {
-			case sig := <-sigCh:
-				log.Printf("Received %s, shutting down", sig)
-				return
-			default:
-			}
-			portName, err = detectPort()
-			if err == nil {
-				break
-			}
-			time.Sleep(2 * time.Second)
+	for {
+		portName, ok := waitForPort(*portFlag, sigCh)
+		if !ok {
+			return
 		}
-	}
 
+		if err := runSession(portName, *intervalFlag, sigCh); err != nil {
+			log.Printf("Device disconnected: %v", err)
+			continue
+		}
+		return
+	}
+}
+
+func waitForPort(explicit string, sigCh <-chan os.Signal) (string, bool) {
+	log.Println("Waiting for device...")
+	for {
+		select {
+		case sig := <-sigCh:
+			log.Printf("Received %s, shutting down", sig)
+			return "", false
+		default:
+		}
+		if explicit != "" {
+			if _, err := os.Stat(explicit); err == nil {
+				return explicit, true
+			}
+		} else {
+			if name, err := detectPort(); err == nil {
+				return name, true
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func runSession(portName string, interval time.Duration, sigCh <-chan os.Signal) error {
 	log.Printf("Opening %s", portName)
 	port, err := serial.Open(portName, &serial.Mode{
 		BaudRate:          115200,
 		InitialStatusBits: &serial.ModemOutputBits{DTR: true, RTS: true},
 	})
 	if err != nil {
-		log.Fatalf("Failed to open serial port: %v", err)
+		return fmt.Errorf("open: %w", err)
 	}
 	defer port.Close()
 	port.SetDTR(true)
 	port.SetRTS(true)
-	port.SetReadTimeout(1 * time.Second)
-
-	scanner := bufio.NewScanner(port)
-	scanner.Buffer(make([]byte, 8192), 8192)
+	port.SetReadTimeout(200 * time.Millisecond)
 
 	log.Println("Waiting for handshake...")
-	sendLine(port, "G")
+	if err := sendLine(port, "G"); err != nil {
+		return fmt.Errorf("handshake: %w", err)
+	}
+	var rxBuf [256]byte
+	rxN := 0
+	lastG := time.Now()
 	connected := false
 	for !connected {
 		select {
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
-			return
+			return nil
 		default:
 		}
-		if scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "R" || line == "N" || strings.HasPrefix(line, "T:") {
-				log.Println("Device connected")
-				connected = true
+		n, err := port.Read(rxBuf[rxN:])
+		if err != nil {
+			return fmt.Errorf("handshake read: %w", err)
+		}
+		rxN += n
+		for i := 0; i < rxN; i++ {
+			if rxBuf[i] == '\n' || rxBuf[i] == '\r' {
+				line := strings.TrimSpace(string(rxBuf[:i]))
+				copy(rxBuf[:], rxBuf[i+1:rxN])
+				rxN -= i + 1
+				if line == "" {
+					break
+				}
+				if line == "R" || line == "N" || strings.HasPrefix(line, "T:") {
+					log.Println("Device connected")
+					connected = true
+				}
+				break
 			}
 		}
-		if !connected {
-			sendLine(port, "G")
+		if !connected && time.Since(lastG) >= 2*time.Second {
+			if err := sendLine(port, "G"); err != nil {
+				return fmt.Errorf("handshake: %w", err)
+			}
+			lastG = time.Now()
 		}
 	}
 
-	client := claude.NewClient(creds.AccessToken)
+	go func() {
+		var buf [256]byte
+		for {
+			if _, err := port.Read(buf[:]); err != nil {
+				return
+			}
+		}
+	}()
 
-	log.Printf("Polling every %s", *intervalFlag)
-	ticker := time.NewTicker(*intervalFlag)
+	log.Printf("Polling every %s", interval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	refreshTimer := time.NewTimer(time.Until(next4AM()))
 	defer refreshTimer.Stop()
 
 	var lastH5ResetMin int64 = -99
-	pollFn := func() {
-		lastH5ResetMin = poll(client, port, lastH5ResetMin)
+	var lastWasError bool
+	pollFn := func() error {
+		result, wasError, err := poll(port, lastH5ResetMin, lastWasError)
+		if err != nil {
+			return err
+		}
+		lastH5ResetMin = result
+		lastWasError = wasError
+		return nil
 	}
 
-	pollFn()
+	if err := pollFn(); err != nil {
+		return err
+	}
 	for {
 		select {
 		case <-ticker.C:
-			pollFn()
+			if err := pollFn(); err != nil {
+				return err
+			}
 		case <-refreshTimer.C:
 			log.Println("Nightly full refresh")
-			sendLine(port, "F")
-			pollFn()
+			if err := sendLine(port, "F"); err != nil {
+				return err
+			}
+			if err := pollFn(); err != nil {
+				return err
+			}
 			refreshTimer.Reset(time.Until(next4AM()))
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
-			return
+			return nil
 		}
 	}
 }
 
-func poll(client *claude.Client, port serial.Port, prevH5ResetMin int64) int64 {
+func poll(port serial.Port, prevH5ResetMin int64, prevWasError bool) (int64, bool, error) {
+	creds, err := claude.LoadCredentials()
+	if err != nil {
+		if !prevWasError {
+			log.Printf("Failed to load credentials: %v", err)
+		}
+		if err := sendLine(port, "E"); err != nil {
+			return prevH5ResetMin, true, err
+		}
+		return prevH5ResetMin, true, nil
+	}
+
+	client := claude.NewClient(creds.AccessToken)
 	usage, err := client.FetchUsage()
 	if err != nil {
 		if _, ok := err.(claude.ErrAuth); ok {
-			log.Println("Token expired or revoked — run 'claude' to re-authenticate")
-			sendLine(port, "E")
-			return prevH5ResetMin
+			if !prevWasError {
+				log.Println("Token expired or revoked — run 'claude' to re-authenticate")
+			}
+			if err := sendLine(port, "E"); err != nil {
+				return prevH5ResetMin, true, err
+			}
+			return prevH5ResetMin, true, nil
 		}
 		log.Printf("API error: %v", err)
-		return prevH5ResetMin
+		return prevH5ResetMin, false, nil
+	}
+
+	if prevWasError {
+		log.Println("Credentials refreshed, resuming")
 	}
 
 	h5resetMin := int64(-1)
@@ -165,12 +238,15 @@ func poll(client *claude.Client, port serial.Port, prevH5ResetMin int64) int64 {
 		strconv.FormatInt(w1resetMin, 10)
 
 	log.Printf("5h: %d/%d  1w: %d/%d", usage.H5Used, usage.H5Limit, usage.W1Used, usage.W1Limit)
-	sendLine(port, msg)
-	return h5resetMin
+	if err := sendLine(port, msg); err != nil {
+		return prevH5ResetMin, false, err
+	}
+	return h5resetMin, false, nil
 }
 
-func sendLine(port serial.Port, s string) {
-	port.Write([]byte(s + "\n"))
+func sendLine(port serial.Port, s string) error {
+	_, err := port.Write([]byte(s + "\n"))
+	return err
 }
 
 func detectPort() (string, error) {

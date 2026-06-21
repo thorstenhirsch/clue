@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const buildID = "CLUE-FW-17"
+const buildID = "CLUE-FW-19"
 
 type state uint8
 
@@ -90,25 +90,15 @@ func handleMessage(line string) {
 		if !ok {
 			return
 		}
-		if currentState == stateRunning && !usageChanged(&u, &lastUsage) {
-			return
-		}
-		needsFull := currentState != stateRunning ||
-			redContentChanged(&u, &lastUsage) ||
-			display.DiffCount >= 10
 		currentState = stateRunning
-		lastUsage = u
-		renderUsageScreen(&display, &u)
-		if needsFull {
-			display.DisplayFull()
-		} else {
-			display.DisplayDiff()
-		}
+		updateUsage(&display, &lastUsage, u)
+		sendLine("DBG:U ms=" + strconv.Itoa(display.LastRefreshMS) +
+			" diff=" + strconv.Itoa(display.DiffCount) +
+			" tier=" + display.LastTier)
 
 	case line == "E":
 		currentState = stateError
-		renderErrorScreen(&display)
-		display.Display()
+		showError(&display)
 
 	case strings.HasPrefix(line, "S:"):
 		token := line[2:]
@@ -144,6 +134,15 @@ func handleMessage(line string) {
 		display.Display()
 		sendLine("DBG:T:C done ms=" + strconv.Itoa(display.LastRefreshMS) +
 			" timeout=" + strconv.FormatBool(display.LastTimeout))
+
+	case line == "P":
+		if currentState == stateRunning {
+			renderUsageScreen(&display, &lastUsage)
+			display.RefreshSmart()
+			sendLine("DBG:P ms=" + strconv.Itoa(display.LastRefreshMS) +
+				" diff=" + strconv.Itoa(display.DiffCount) +
+				" timeout=" + strconv.FormatBool(display.LastTimeout))
+		}
 	}
 }
 
@@ -202,9 +201,3 @@ func sendLine(s string) {
 	machine.Serial.Write([]byte{'\n'})
 }
 
-func boolBit(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
-}
