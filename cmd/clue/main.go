@@ -15,9 +15,15 @@ import (
 	"go.bug.st/serial"
 )
 
+const (
+	intervalCredCheck = 2 * time.Second
+	intervalBW        = 10 * time.Second
+	intervalTri       = 15 * time.Second
+	intervalFull      = 30 * time.Second
+)
+
 func main() {
 	portFlag := flag.String("port", "", "serial port (e.g. /dev/ttyACM0); auto-detected if empty")
-	intervalFlag := flag.Duration("interval", 30*time.Second, "polling interval")
 	flag.Parse()
 
 	if _, err := claude.LoadCredentials(); err != nil {
@@ -33,7 +39,7 @@ func main() {
 			return
 		}
 
-		if err := runSession(portName, *intervalFlag, sigCh); err != nil {
+		if err := runSession(portName, sigCh); err != nil {
 			log.Printf("Device disconnected: %v", err)
 			continue
 		}
@@ -63,7 +69,7 @@ func waitForPort(explicit string, sigCh <-chan os.Signal) (string, bool) {
 	}
 }
 
-func runSession(portName string, interval time.Duration, sigCh <-chan os.Signal) error {
+func runSession(portName string, sigCh <-chan os.Signal) error {
 	log.Printf("Opening %s", portName)
 	port, err := serial.Open(portName, &serial.Mode{
 		BaudRate:          115200,
@@ -120,7 +126,9 @@ func runSession(portName string, interval time.Duration, sigCh <-chan os.Signal)
 		}
 	}
 
+	disconnected := make(chan struct{})
 	go func() {
+		defer close(disconnected)
 		var buf [256]byte
 		for {
 			if _, err := port.Read(buf[:]); err != nil {
@@ -129,43 +137,50 @@ func runSession(portName string, interval time.Duration, sigCh <-chan os.Signal)
 		}
 	}()
 
-	log.Printf("Polling every %s", interval)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	refreshTimer := time.NewTimer(time.Until(next4AM()))
 	defer refreshTimer.Stop()
 
 	var lastH5ResetMin int64 = -99
 	var lastWasError bool
+	var nextInterval time.Duration
+
 	pollFn := func() error {
-		result, wasError, err := poll(port, lastH5ResetMin, lastWasError)
+		result, wasError, interval, err := poll(port, lastH5ResetMin, lastWasError)
 		if err != nil {
 			return err
 		}
 		lastH5ResetMin = result
 		lastWasError = wasError
+		nextInterval = interval
 		return nil
 	}
 
 	if err := pollFn(); err != nil {
 		return err
 	}
+	nextInterval = intervalFull
+	log.Printf("Next poll in %s", nextInterval)
+
+	pollTimer := time.NewTimer(nextInterval)
+	defer pollTimer.Stop()
+
 	for {
 		select {
-		case <-ticker.C:
+		case <-pollTimer.C:
 			if err := pollFn(); err != nil {
 				return err
 			}
+			log.Printf("Next poll in %s", nextInterval)
+			pollTimer.Reset(nextInterval)
 		case <-refreshTimer.C:
 			log.Println("Nightly full refresh")
 			if err := sendLine(port, "F"); err != nil {
 				return err
 			}
-			if err := pollFn(); err != nil {
-				return err
-			}
+			pollTimer.Reset(intervalFull)
 			refreshTimer.Reset(time.Until(next4AM()))
+		case <-disconnected:
+			return fmt.Errorf("device gone")
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
 			return nil
@@ -173,16 +188,16 @@ func runSession(portName string, interval time.Duration, sigCh <-chan os.Signal)
 	}
 }
 
-func poll(port serial.Port, prevH5ResetMin int64, prevWasError bool) (int64, bool, error) {
+func poll(port serial.Port, prevH5ResetMin int64, prevWasError bool) (int64, bool, time.Duration, error) {
 	creds, err := claude.LoadCredentials()
 	if err != nil {
 		if !prevWasError {
 			log.Printf("Failed to load credentials: %v", err)
 		}
 		if err := sendLine(port, "E"); err != nil {
-			return prevH5ResetMin, true, err
+			return prevH5ResetMin, true, intervalCredCheck, err
 		}
-		return prevH5ResetMin, true, nil
+		return prevH5ResetMin, true, intervalCredCheck, nil
 	}
 
 	client := claude.NewClient(creds.AccessToken)
@@ -193,12 +208,12 @@ func poll(port serial.Port, prevH5ResetMin int64, prevWasError bool) (int64, boo
 				log.Println("Token expired or revoked — run 'claude' to re-authenticate")
 			}
 			if err := sendLine(port, "E"); err != nil {
-				return prevH5ResetMin, true, err
+				return prevH5ResetMin, true, intervalCredCheck, err
 			}
-			return prevH5ResetMin, true, nil
+			return prevH5ResetMin, true, intervalCredCheck, nil
 		}
 		log.Printf("API error: %v", err)
-		return prevH5ResetMin, false, nil
+		return prevH5ResetMin, false, intervalBW, nil
 	}
 
 	if prevWasError {
@@ -239,9 +254,16 @@ func poll(port serial.Port, prevH5ResetMin int64, prevWasError bool) (int64, boo
 
 	log.Printf("5h: %d/%d  1w: %d/%d", usage.H5Used, usage.H5Limit, usage.W1Used, usage.W1Limit)
 	if err := sendLine(port, msg); err != nil {
-		return prevH5ResetMin, false, err
+		return prevH5ResetMin, false, intervalBW, err
 	}
-	return h5resetMin, false, nil
+
+	interval := intervalBW
+	h5pct := usage.H5Used * 100 / usage.H5Limit
+	w1pct := usage.W1Used * 100 / usage.W1Limit
+	if h5pct >= 80 || w1pct >= 80 {
+		interval = intervalTri
+	}
+	return h5resetMin, false, interval, nil
 }
 
 func sendLine(port serial.Port, s string) error {
