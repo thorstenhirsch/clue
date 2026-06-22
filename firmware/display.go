@@ -76,6 +76,27 @@ func pct(used, limit int64) int64 {
 	return p
 }
 
+// blinkCount returns how many times the alert LED should blink for thresholds
+// crossed between old and cur. Hitting 100% on either window blinks 5; the
+// 5-hour window crossing 80% blinks 3. Weekly 80% is intentionally ignored.
+// The very first reading after boot (sentinel old.H5Limit < 0) never blinks.
+func blinkCount(old, cur *UsageData) int {
+	if old.H5Limit < 0 {
+		return 0
+	}
+	h5o, h5n := pct(old.H5Used, old.H5Limit), pct(cur.H5Used, cur.H5Limit)
+	w1o, w1n := pct(old.W1Used, old.W1Limit), pct(cur.W1Used, cur.W1Limit)
+	switch {
+	case h5o < 100 && h5n >= 100:
+		return 5
+	case w1o < 100 && w1n >= 100:
+		return 5
+	case h5o < 80 && h5n >= 80:
+		return 3
+	}
+	return 0
+}
+
 func renderUsageScreen(d *EPD, u *UsageData) {
 	d.ClearBuffer()
 

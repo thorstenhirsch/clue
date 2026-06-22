@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/torti/tiny-claude-eink-display/claude"
+	"github.com/thorstenhirsch/clue/claude"
 	"go.bug.st/serial"
 )
 
@@ -183,6 +183,7 @@ func runSession(portName string, sigCh <-chan os.Signal) error {
 			return fmt.Errorf("device gone")
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
+			sendLine(port, "L:0")
 			return nil
 		}
 	}

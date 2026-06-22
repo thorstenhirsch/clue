@@ -24,6 +24,7 @@ var (
 	lastUsage    = UsageData{H5Limit: -1, H5ResetMin: -1, W1ResetDay: -1, W1ResetMin: -1}
 	serialBuf    [4096]byte
 	serialPos    int
+	led          machine.Pin
 )
 
 func main() {
@@ -43,6 +44,10 @@ func main() {
 		machine.P0_20, // BUSY
 	)
 	display.Configure()
+
+	led = machine.P0_11
+	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	led.High() // steady reading light
 
 	token := readToken()
 	if token == "" {
@@ -135,6 +140,11 @@ func handleMessage(line string) {
 		sendLine("DBG:T:C done ms=" + strconv.Itoa(display.LastRefreshMS) +
 			" timeout=" + strconv.FormatBool(display.LastTimeout))
 
+	case line == "L:0":
+		led.Low()
+	case line == "L:1":
+		led.High()
+
 	case line == "P":
 		if currentState == stateRunning {
 			renderUsageScreen(&display, &lastUsage)
@@ -199,5 +209,16 @@ func readLine() string {
 func sendLine(s string) {
 	machine.Serial.Write([]byte(s))
 	machine.Serial.Write([]byte{'\n'})
+}
+
+// blink produces n dark pulses on the reading-light LED.
+// The LED idles HIGH (on), so each cycle is off→on.
+func blink(n int) {
+	for i := 0; i < n; i++ {
+		led.Low()
+		time.Sleep(200 * time.Millisecond)
+		led.High()
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 

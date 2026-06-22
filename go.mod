@@ -1,4 +1,4 @@
-module github.com/torti/tiny-claude-eink-display
+module github.com/thorstenhirsch/clue
 
 go 1.26.4
 
