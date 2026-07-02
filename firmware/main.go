@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const buildID = "CLUE-FW-19"
+const buildID = "CLUE-FW-21"
 
 type state uint8
 
@@ -145,6 +145,16 @@ func handleMessage(line string) {
 	case line == "L:1":
 		led.High()
 
+	case line == "M:0":
+		display.FastFullMode = false
+		sendLine("DBG:M fastfull=false")
+	case line == "M:1":
+		display.FastFullMode = true
+		sendLine("DBG:M fastfull=true")
+
+	case strings.HasPrefix(line, "X:"):
+		handleTuning(line[2:])
+
 	case line == "P":
 		if currentState == stateRunning {
 			renderUsageScreen(&display, &lastUsage)
@@ -154,6 +164,31 @@ func handleMessage(line string) {
 				" timeout=" + strconv.FormatBool(display.LastTimeout))
 		}
 	}
+}
+
+// handleTuning parses "X:<bwReps>:<triPasses>:<redRP>" and updates the
+// live refresh parameters (RAM-only, reset to defaults on reboot).
+// "X:6:3:4" = defaults. See the tunable vars in epd.go.
+func handleTuning(data string) {
+	parts := strings.Split(data, ":")
+	if len(parts) < 3 {
+		sendLine("DBG:X parse error")
+		return
+	}
+	bw, err1 := strconv.Atoi(parts[0])
+	passes, err2 := strconv.Atoi(parts[1])
+	rp, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil ||
+		bw < 1 || bw > 50 || passes < 1 || passes > 6 || rp < 0 || rp > 255 {
+		sendLine("DBG:X invalid (bwReps 1-50, triPasses 1-6, redRP 0-255)")
+		return
+	}
+	bwReps = bw
+	triPasses = passes
+	redRP = rp
+	sendLine("DBG:X bwReps=" + strconv.Itoa(bwReps) +
+		" triPasses=" + strconv.Itoa(triPasses) +
+		" redRP=" + strconv.Itoa(redRP))
 }
 
 func parseUsage(data string) (UsageData, bool) {
@@ -221,4 +256,3 @@ func blink(n int) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
-

@@ -40,8 +40,11 @@ Newline-delimited ASCII messages between device and host:
 | Host→Device | `E` | Auth error — token expired |
 | Host→Device | `F` | Force full OTP refresh with current data |
 | Host→Device | `G` | Request token/status |
-| Host→Device | `M:0\|1\|2` | Set B/W partial mode: 0=OTP 0xFF, 1=diffLUT 0xCF, 2=full OTP fallback |
+| Host→Device | `M:0\|1` | Fast-full mode: 1=RefreshSmart-internal fulls (anti-ghost, red-cleared) use temp-spoofed 90°C OTP waveform (default), 0=all fulls use true OTP 0xF7 |
+| Host→Device | `X:bwReps:triPasses:redRP` | Live-tune refresh frame counts (RAM-only; defaults `X:6:3:4`) |
 | Host→Device | `P` | Test partial refresh with current data |
+
+`./clue-test -cmd "X:6:2:4"` sends a single raw command and prints responses (stop the `clue` daemon first).
 
 Reset fields: `h5resetMin` = minute-of-day (0-1439, or -1), `w1resetDay` = weekday (0=Sun..6=Sat, or -1), `w1resetMin` = minute-of-day. The host computes these from the API's RFC3339 reset timestamps and sends absolute local clock times so the firmware doesn't need an RTC.
 
@@ -64,11 +67,12 @@ Reset fields: `h5resetMin` = minute-of-day (0-1439, or -1), `w1resetDay` = weekd
 - Red polarity: `redPixelClearsBit = false` (set bit = red pixel). Red buffer inits to 0x00
 - **Threshold-driven red**: both sections default to **black**; bar+title turn **red** at **≥80%** usage. Big %, reset time, and token stats always stay black (they change frequently — keeping them B/W enables fast partial refresh). Red pixels only grow (title switches black→red once; bar fill adds red as it grows). When usage drops below 80% (reset), red must be cleared via a full OTP refresh — `RefreshSmart` detects this automatically via `anyRedCleared()`. Progress bars + big 2×-scaled digit glyphs
 - **CRITICAL — Reversed voltage polarity on this panel**: on the GDEY029Z94, **VSH1 drives BLACK** and **VSL drives WHITE** — the reverse of the SSD1680 datasheet naming convention (which says VSH1 = "source high" and VSL = "source low"). The OTP waveform is calibrated for this panel and produces correct output. **All custom LUTs must use VSH1 (01) for black and VSL (10) for white.** VSH2 (11) drives red as expected. Getting this wrong causes B/W inversion — this was the root cause of every B/W inversion bug we encountered. Never assume VSH1=white, VSL=black from the datasheet — verify against the OTP's behaviour on the actual panel
-- **Smart refresh engine** with pixel-level diffing (CLUE-FW-19):
+- **Smart refresh engine** with pixel-level diffing (CLUE-FW-21):
   - `RefreshSmart()` compares working buffers against last-displayed snapshot, picks cheapest tier
   - Full-screen OTP (`0xF7`) for init / 4am / every 8 partials (anti-ghost) / red pixel removal
-  - Tri-color custom LUT (`triLUT` + `0xC7`, Mode 1, 2-group, 3-pass) when red pixels are added — Group 0 clears BW residue with VSL (white), Group 1 drives VSH2 (red) for saturation
-  - Fast B/W refresh (`diffLUT` + `0xC7`, Mode 1, 5-pass) for B/W-only changes — all pixels reinforced to prevent fading
+  - Tri-color custom LUT (`buildTriLUT` + `0xC7`, Mode 1, single activation) when red pixels are added — `triPasses` interleaved group pairs: even groups clear BW residue with VSL (white), odd groups drive VSH2 (red) 30 frames × (redRP+1) reps for saturation
+  - Fast B/W refresh (`buildDiffLUT` + `0xC7`, Mode 1, single activation) for B/W-only changes — all pixels reinforced `bwReps` × 10 frames to prevent fading
+  - Frame counts are live-tunable via the `X:` serial command (defaults `X:6:3:4`, hardware-tuned July 2026 — `X:6:2:4` showed shadows; `X:10:3:4` reproduces the CLUE-FW-19 frame sequence)
   - Pixel diff skips refresh entirely when nothing changed
 - **All custom refreshes use Mode 1 (`0xC7`)** — Mode 2 (`0xCF`, differential) was abandoned because its LUT index mapping depends on controller state that the OTP modifies unpredictably, causing B/W inversion on the first custom refresh after any 0xF7
 - **Controller standby**: every refresh sequence (0xF7/0xC7) ends by disabling clock+analog. All refresh functions call `wake()` (0xC0 + master activation) before SPI writes. `DisplayFull` also calls `initRegisters()` after OTP to reset any registers the OTP modified
@@ -234,39 +238,46 @@ Spoofing the temperature register (cmd 0x1A) selects a different band.
 
 **Root cause (resolved June 2026)**: The Adafruit voltage values are for a DIFFERENT panel (Adafruit 2.9" SSD1680). Our WeAct/GDEY029Z94 panel needs its own OTP-calibrated voltages. **Writing any voltage registers at all was the mistake** — it overwrote the correct OTP values that 0xF7 had loaded. GxEPD2's SSD1680 drivers **never** write 0x03/0x04/0x2C, confirming this is the correct approach.
 
-### Attempt 5: Smart Refresh Engine (CLUE-FW-19 — CURRENT)
+### Attempt 5: Smart Refresh Engine (CLUE-FW-20/21 — CURRENT)
 
 **Approach**: Run one 0xF7 at init (loads correct OTP voltages into registers), then never write voltage registers again. Custom LUTs via cmd 0x32 reuse the persisted OTP voltages. Pixel-level diffing selects the cheapest refresh tier. `DisplayFull` re-sends cmd 0x21 `{0x00, 0x80}` after OTP completes to restore B/W polarity; `refreshTriColor` re-sends it before each pass.
 
 **Key insight**: The SSD1680 voltage registers persist between refreshes. A 0xF7 refresh auto-loads them from OTP. Subsequent custom LUT operations reference the same correct voltages — no manual writes needed. This is how GxEPD2 (mono partial) works: OTP loads voltages, then `0xFC` (OTP Mode 2) reuses them.
 
-**B/W partial flow** (Mode 2, full-screen): write OLD B/W (`dispBuffer`) to **0x24** and NEW B/W (`buffer`) to **0x26**, trigger with 0xCF. On this panel `0x24` is the "old"/high bit and `0x26` the "new"/low bit for Mode 2 LUT selection (the reverse of what many SSD1680 docs state — confirmed by panel behaviour). Unchanged pixels map to LUT0/LUT3 = VSS (no drive, no flicker). Both full buffers are written each time (~19ms SPI overhead at 4MHz) to avoid stale RAM outside a dirty window. Sub-second total.
+**B/W flow** (Mode 1, full-screen, single activation): write NEW B/W (`buffer`) to **0x24** and the red buffer (all zeros) to **0x26**, upload `buildDiffLUT(bwReps)` via 0x32, trigger 0xC7 **once**. Every pixel is driven to its target state for `bwReps` × 10 frames (group 0 repeat count) — reinforcement prevents fading of unchanged pixels, and driving a pixel to the state it's already in doesn't visibly flash. Both full buffers are written each time (~19ms SPI overhead at 4MHz) to avoid stale RAM outside a dirty window. (Mode 2/0xCF differential was abandoned — see "All custom refreshes use Mode 1" above. The earlier 5-trigger loop was folded into the LUT's RP field, saving four analog power-up/power-down cycles.)
 
-**Red/tri-color flow** (Mode 1, 3-pass): write full BW+red to 0x24/0x26, then trigger `triLUT` + 0xC7 three times to build up red pigment saturation (~9s total). Each pass reinforces existing red pixels and establishes new ones. Red is additive-only between resets — the no-clear LUT never erases red.
+**Red/tri-color flow** (Mode 1, single activation): write full BW+red to 0x24/0x26, upload `buildTriLUT(triPasses, redRP)`, trigger 0xC7 **once**. The LUT contains `triPasses` interleaved group pairs — a 10-frame BW reinforce/clear group followed by a 30-frame × (redRP+1) VSH2 red-drive group — reproducing the old 3-trigger pass structure inside one activation (saves two power cycles vs CLUE-FW-19, ~15s for OTP full as comparison). Red is additive-only between resets — the no-clear LUT never erases red.
 
-**Red removal**: When usage drops below 80% at reset, red pixels need clearing. `anyRedCleared()` detects bits that were set in the displayed red buffer but cleared in the new one. `RefreshSmart` forces a full OTP refresh in this case — only a 0xF7 can reliably erase red.
+**Red removal**: When usage drops below 80% at reset, red pixels need clearing. `anyRedCleared()` detects bits that were set in the displayed red buffer but cleared in the new one. `RefreshSmart` forces a full OTP refresh in this case — only a full OTP waveform can reliably erase red.
 
-**Debug harness**: `M:0` (OTP 0xFF), `M:1` (diffLUT 0xCF, default), `M:2` (full OTP) — switch via serial without reflashing.
+**Debug harness**: `X:bwReps:triPasses:redRP` live-tunes the custom LUT frame counts (defaults `X:6:3:4`, hardware-tuned); `M:0|1` toggles fast-full mode (default on) — with `M:1`, RefreshSmart-internal full refreshes (anti-ghost every-8, red-cleared) run the Waveshare V4 fast sequence (0x1A=0x5A temp spoof → 0x22=0x91 OTP load → 0xC7 display; same phases, faster clocking; `LastTier="fastfull"`). Init, 4am `F`, and red-first-appearing fulls always stay true 0xF7. All switchable via serial without reflashing (`./clue-test -cmd`).
 
-### Current State (CLUE-FW-19)
+### Current State (CLUE-FW-21)
 
-- `DisplayFull()` uses **0xF7 (OTP)** — reliable, correct colors, auto-loads voltage registers. Re-sends cmd 0x21 `{0x00, 0x80}` after OTP completes to restore B/W polarity
+- `DisplayFull()` uses **0xF7 (OTP)** — reliable, correct colors, auto-loads voltage registers. `initRegisters()` re-runs after every full to restore registers the OTP modified
 - `RefreshSmart()` picks the cheapest tier via pixel-level diffing:
-  - Full-screen OTP for init / 4am / every 8 partials / red pixel removal (`anyRedCleared()`)
-  - Tri-color custom LUT (`triLUT` + `0xC7`, 3-pass) for additive red changes (~9s)
-  - Full-screen differential (`diffLUT` + `0xCF`, OLD→0x24, NEW→0x26) for B/W-only changes — sub-second, no flicker, **no voltage register writes**
+  - Full-screen OTP for init / 4am / every 8 partials / red pixel removal (`anyRedCleared()`); the anti-ghost and red-removal fulls use the temp-spoofed fast OTP waveform by default (disable via `M:0`) — hardware-verified equivalent to true 0xF7 for ghost clearing and red quality (July 2026)
+  - Tri-color custom LUT (`buildTriLUT` + `0xC7`, single activation, interleaved groups) for additive red changes
+  - Fast B/W (`buildDiffLUT` + `0xC7`, single activation, reinforcement) for B/W-only changes — **no voltage register writes**
   - Skip when nothing changed
-- `M:0|1|2` serial command switches B/W partial mode without reflashing
-- Nightly 4am forced full refresh via `F` serial command
+- Defaults hardware-tuned July 2026: `bwReps=6` (down from 10; still shadow-free), `triPasses=3`, `redRP=4` (`X:6:2:4` produced shadows — 3 tri passes is the floor)
+- `X:` serial command live-tunes frame counts; `M:0|1` toggles fast-full — both without reflashing
+- Nightly 4am forced full refresh via `F` serial command (always true 0xF7)
 - Error screen (`E` command) renders in black-only via `RefreshSmart()` — fast B/W partial
+
+### Comparison with reference drivers (researched July 2026)
+
+- **GxEPD2_290_C90c** (this exact panel): full OTP 0xF7 only, `hasFastPartialUpdate = false`, 27s refresh budget; its "partial window" refresh still runs the full OTP waveform. No custom LUTs. Power-on ≈100ms, power-off ≈150ms per activation (the overhead our single-activation LUTs avoid paying repeatedly)
+- **Waveshare epd2in9b_V4**: full = 0xF7; fast = temp-spoof 90°C + 0x91 + 0xC7 (now our `M:1`); partial = OTP Mode 2 (0x22=0x1C) which depends on the V4 panel's OTP having a partial waveform — not portable here
+- **Good Display official**: 16s full refresh; tri-color partial officially unsupported. This firmware's custom-LUT tiers are ahead of all published drivers for this panel
 
 ### What to Try Next
 
 1. **Read OTP voltage values**: Use cmd 0x2D after an OTP load to read back the panel's actual VGH/VSH1/VSH2/VSL/VCOM. Could enable a custom `fullLUT` + `0xC7` for faster full refreshes (cutting ~15s to ~2-4s).
 
-2. **Optimize the 4am/init full refresh**: Once the correct OTP voltages are known, write a custom `fullLUT` with fewer groups and use `0xC7` (no OTP reload). Gate behind `M:` harness.
+2. **Lower `redRP`**: `triPasses` is at its floor (2 passes shadowed), but `redRP` hasn't been bisected — try `X:6:3:3` / `X:6:3:2` for a shorter red drive if tri-refresh time matters.
 
-3. **Tune tri-color pass count**: The 3-pass `refreshTriColor` builds adequate red saturation in ~9s. With known OTP voltages, a stronger single-pass LUT might achieve the same result faster.
+Done (July 2026): frame-count tuning via `X:` (winners `X:6:3:4` baked in as defaults) and the `M:1` fast-full A/B (equivalent quality — now the default for anti-ghost/red-removal fulls).
 
 ### Sources
 

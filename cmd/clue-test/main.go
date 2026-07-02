@@ -26,6 +26,7 @@ type step struct {
 func main() {
 	portFlag := flag.String("port", "", "serial port (e.g. /dev/ttyACM0); auto-detected if empty")
 	pauseFlag := flag.Duration("pause", 3*time.Second, "viewing pause after refresh completes")
+	cmdFlag := flag.String("cmd", "", "send a single raw command line (e.g. \"X:6:2:4\" or \"M:1\"), print responses, exit")
 	flag.Parse()
 
 	sigCh := make(chan os.Signal, 1)
@@ -69,6 +70,13 @@ func main() {
 		return
 	}
 	log.Println("Device connected")
+
+	if *cmdFlag != "" {
+		log.Printf("-> %s", *cmdFlag)
+		sendLine(port, *cmdFlag)
+		drainResponse(port, 3*time.Second)
+		return
+	}
 
 	limit := 1_000_000
 

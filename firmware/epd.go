@@ -11,7 +11,7 @@ import (
 const (
 	epdW      = 128
 	epdH      = 296
-	epdStride = epdW / 8   // 16 bytes per gate line
+	epdStride = epdW / 8         // 16 bytes per gate line
 	epdBufSz  = epdStride * epdH // 4736 bytes
 )
 
@@ -20,71 +20,67 @@ const (
 // If red appears inverted on the display, flip this single constant.
 const redPixelClearsBit = false
 
-// triLUT: no-clear tri-color refresh — directly applies target voltage
-// without clearing phases. Unchanged pixels get reinforced (no visible flash).
-// Used by refreshTriColor() with cmd 0x32 + 0xC7 (custom LUT, Mode 1).
+// Tunable refresh parameters (RAM-only; adjust live via the "X:" serial
+// command, e.g. "X:6:3:4" = defaults). Hardware-tuned July 2026: bwReps 6 is
+// the verified minimum with no shadows (X:6:2:4 showed shadows, so triPasses
+// stays at 3). "X:10:3:4" reproduces the CLUE-FW-19 frame sequence.
+var (
+	bwReps    = 6 // B/W refresh: reps of the 10-frame reinforcement group
+	triPasses = 3 // tri-color: number of interleaved [BW + red] group pairs
+	redRP     = 4 // tri-color: RP field of each red group (4 = 5 reps × 30 frames)
+)
+
+// buildTriLUT constructs the no-clear tri-color LUT (cmd 0x32 + 0xC7, Mode 1).
+// Directly applies target voltages without clearing phases, so unchanged
+// pixels don't flash. The old 3-trigger pass loop lives inside the LUT as
+// interleaved groups: pass p = group 2p (10-frame BW reinforce/clear) +
+// group 2p+1 (30-frame VSH2 red drive × (redRP+1) reps). One activation
+// instead of `passes` power-up/power-down cycles. Max 6 passes (12 groups).
 // OTP-loaded voltages from the initial 0xF7 persist and are reused.
-var triLUT = [153]byte{
-	// LUT0 (black, R=0 BW=0): G0=VSH1(black), G1=VSS
-	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT1 (white, R=0 BW=1): G0=VSL(white), G1=VSS
-	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT2 (red, R=1 BW=0): G0=VSL(clear BW to white), G1=VSH2(drive red)
-	0x80, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT3 (red, R=1 BW=1): G0=VSL(clear BW to white), G1=VSH2(drive red)
-	0x80, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT4 (VCOM): VSS
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// Group 0: TP[A]=10, RP=0 — clear BW residue / reinforce B/W pixels
-	10, 0, 0, 0, 0, 0, 0,
-	// Group 1: TP[A]=30, RP=4 (5 reps) — drive red pigment saturation
-	30, 0, 0, 0, 0, 0, 4,
-	// Groups 2-11: inactive
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	// FR
-	0x33, 0, 0, 0, 0, 0,
-	// XON
-	0, 0, 0,
+func buildTriLUT(passes, redRP int) [153]byte {
+	var lut [153]byte
+	for p := 0; p < passes; p++ {
+		gBW := 2 * p
+		gRed := gBW + 1
+		// VS section: LUT n group g at byte n*12+g, phase A in D7-D6.
+		lut[0*12+gBW] = 0x40  // LUT0 black: VSH1 (drives black on this panel)
+		lut[1*12+gBW] = 0x80  // LUT1 white: VSL (drives white on this panel)
+		lut[2*12+gBW] = 0x80  // LUT2 red: VSL clears BW residue to white
+		lut[3*12+gBW] = 0x80  // LUT3 red: VSL clears BW residue to white
+		lut[2*12+gRed] = 0xC0 // LUT2 red: VSH2 drives red pigment
+		lut[3*12+gRed] = 0xC0 // LUT3 red: VSH2 drives red pigment
+		// LUT4 (VCOM): stays VSS. Timing: 7 bytes per group from byte 60,
+		// TP[A] first, RP last.
+		lut[60+7*gBW] = 10
+		lut[60+7*gRed] = 30
+		lut[60+7*gRed+6] = byte(redRP)
+	}
+	// FR=3 for all groups (nibble-packed)
+	for i := 144; i < 150; i++ {
+		lut[i] = 0x33
+	}
+	return lut
 }
 
-// diffLUT: 1 group — fast B/W refresh with reinforcement (Mode 1, 0xC7).
-// All pixels are driven to their target state on every refresh, preventing
-// fading of unchanged pixels. On this panel VSH1 drives black, VSL drives
-// white (reversed from datasheet naming — confirmed by OTP behaviour).
-// No voltage register writes needed — OTP-loaded voltages persist.
-var diffLUT = [153]byte{
-	// LUT0 (R=0 BW=0, black): reinforce with VSH1 — on this panel VSH1 drives black
-	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT1 (R=0 BW=1, white): reinforce with VSL — on this panel VSL drives white
-	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT2 (R=1 BW=0): VSH1 (unused — no red pixels in B/W-only refresh)
-	0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT3 (R=1 BW=1): VSL (unused — no red pixels in B/W-only refresh)
-	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// LUT4 (VCOM): all DCVCOM
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	// Group 0: TP=10, RP=1 (2 reps)
-	10, 0, 0, 0, 0, 0, 1,
-	// Groups 1-11: inactive
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0,
-	// FR
-	0x33, 0, 0, 0, 0, 0,
-	// XON
-	0, 0, 0,
+// buildDiffLUT constructs the fast B/W LUT (cmd 0x32 + 0xC7, Mode 1): one
+// group of 10 frames × reps. All pixels are driven to their target state on
+// every refresh, preventing fading of unchanged pixels. On this panel VSH1
+// drives black, VSL drives white (reversed from datasheet naming — confirmed
+// by OTP behaviour). No voltage register writes needed — OTP-loaded voltages
+// persist.
+func buildDiffLUT(reps int) [153]byte {
+	var lut [153]byte
+	lut[0*12] = 0x40 // LUT0 (R=0 BW=0, black): reinforce with VSH1
+	lut[1*12] = 0x80 // LUT1 (R=0 BW=1, white): reinforce with VSL
+	lut[2*12] = 0x40 // LUT2 (unused — no red pixels in B/W-only refresh)
+	lut[3*12] = 0x80 // LUT3 (unused — no red pixels in B/W-only refresh)
+	// LUT4 (VCOM): stays VSS
+	lut[60] = 10               // group 0: TP[A] = 10 frames
+	lut[60+6] = byte(reps - 1) // RP = reps-1
+	for i := 144; i < 150; i++ {
+		lut[i] = 0x33
+	}
+	return lut
 }
 
 // box represents a dirty rectangle in buffer coordinates.
@@ -152,11 +148,18 @@ type EPD struct {
 	dispBuffer    [epdBufSz]uint8
 	dispRedBuffer [epdBufSz]uint8
 
-	DiffCount     int    // partial refreshes since last full; auto-full at 8
+	DiffCount     int // partial refreshes since last full; auto-full at 8
 	LastRefreshMS int
 	LastTimeout   bool
-	LastTier      string // "full", "tri", "bw", "skip" — last refresh method
-	ForceFullNext bool // set true to force full OTP on next RefreshSmart
+	LastTier      string // "full", "fastfull", "tri", "bw", "skip" — last refresh method
+	ForceFullNext bool   // set true to force full OTP on next RefreshSmart
+
+	// FastFullMode (default true; "M:0" disables): RefreshSmart's internal
+	// full refreshes (anti-ghost every-8, red-cleared) use the temp-spoofed
+	// 90°C OTP waveform instead of the sensor-temp 0xF7 — same phase
+	// structure, faster clocking. Verified equivalent on hardware July 2026.
+	// Explicit fulls (init, 4am F, red first appearing) always use true 0xF7.
+	FastFullMode bool
 }
 
 func NewEPD(bus drivers.SPI, cs, dc, rst, busy machine.Pin) EPD {
@@ -167,7 +170,7 @@ func NewEPD(bus drivers.SPI, cs, dc, rst, busy machine.Pin) EPD {
 	cs.High()
 	dc.High()
 	rst.High()
-	return EPD{bus: bus, cs: cs, dc: dc, rst: rst, busy: busy}
+	return EPD{bus: bus, cs: cs, dc: dc, rst: rst, busy: busy, FastFullMode: true}
 }
 
 func (d *EPD) Configure() {
@@ -237,6 +240,15 @@ func (d *EPD) Display() error {
 // partial refreshes that use custom LUTs. Never write 0x03/0x04/0x2C/0x3F
 // manually — that broke Attempts 2-4 by overriding the correct OTP values.
 func (d *EPD) DisplayFull() error {
+	return d.displayFull(false)
+}
+
+// displayFull runs a full OTP refresh. fast=false: 0xF7 (sensor temp, the
+// reference waveform). fast=true (Waveshare V4 "fast" sequence): spoof 90°C
+// via 0x1A, load the high-temp OTP band with 0x91, display with 0xC7 — same
+// phase structure, shorter phases. initRegisters() afterwards restores the
+// internal temp sensor (0x18=0x80), so the next 0xF7 uses the real band.
+func (d *EPD) displayFull(fast bool) error {
 	d.wake()
 	d.setWindow(0, 0, epdW-1, epdH-1)
 	d.setPointerNoWait(0, 0)
@@ -249,22 +261,41 @@ func (d *EPD) DisplayFull() error {
 	d.cmd(0x26)
 	d.dataBlock(d.redBuffer[:])
 
-	d.cmd(0x22)
-	d.data(0xF7) // load temp + load OTP LUT + display Mode 1
+	totalMS := 0
+	if fast {
+		d.cmd(0x1A) // write temperature register: 0x5A0 = 90°C
+		d.data(0x5A)
+		d.data(0x00)
+		d.cmd(0x22)
+		d.data(0x91) // load OTP LUT using register temp (no display)
+		d.cmd(0x20)
+		ms, _ := d.waitBusy(5000)
+		totalMS += ms
+		d.cmd(0x22)
+		d.data(0xC7) // display with the just-loaded high-temp OTP LUT
+	} else {
+		d.cmd(0x22)
+		d.data(0xF7) // load temp + load OTP LUT + display Mode 1
+	}
 	d.cmd(0x20)
 
 	ms, timedOut := d.waitBusy(25000)
+	totalMS += ms
 
-	// After 0xF7 the controller is in standby. Wake it, then re-establish
-	// all control registers that the OTP may have modified.
+	// After the refresh the controller is in standby. Wake it, then
+	// re-establish all control registers that the OTP may have modified.
 	d.wake()
 	d.initRegisters()
 
-	d.LastRefreshMS = ms
+	d.LastRefreshMS = totalMS
 	d.LastTimeout = timedOut
 	d.DiffCount = 0
 	d.ForceFullNext = false
-	d.LastTier = "full"
+	if fast {
+		d.LastTier = "fastfull"
+	} else {
+		d.LastTier = "full"
+	}
 
 	// Snapshot the displayed image for future diffs
 	copy(d.dispBuffer[:], d.buffer[:])
@@ -277,7 +308,7 @@ func (d *EPD) DisplayFull() error {
 //   - nothing changed → skip
 //   - forced full / anti-ghost / red cleared → full-screen OTP (0xF7)
 //   - red pixels added → tri-color custom LUT (0xC7, no-clear, additive)
-//   - B/W only changed → fast partial (diffLUT + 0xCF, sub-second, no flicker)
+//   - B/W only changed → fast partial (diffLUT + 0xC7, no flicker)
 func (d *EPD) RefreshSmart() error {
 	bwBox := diffBox(d.buffer[:], d.dispBuffer[:])
 	redBox := diffBox(d.redBuffer[:], d.dispRedBuffer[:])
@@ -289,9 +320,11 @@ func (d *EPD) RefreshSmart() error {
 
 	// Red pixels were removed (e.g. usage dropped below 80% after a reset) —
 	// a no-clear tri-color pass can't erase red, so force a full OTP refresh.
+	// FastFullMode applies only to the internal triggers (anti-ghost, red
+	// cleared); ForceFullNext (init, red first appearing) stays true 0xF7.
 	if d.ForceFullNext || d.DiffCount >= 8 ||
 		anyRedCleared(d.dispRedBuffer[:], d.redBuffer[:]) {
-		return d.DisplayFull()
+		return d.displayFull(d.FastFullMode && !d.ForceFullNext)
 	}
 
 	if !redBox.empty {
@@ -303,12 +336,13 @@ func (d *EPD) RefreshSmart() error {
 }
 
 // refreshTriColor does a fast tri-color refresh using a custom no-clear LUT.
-// Writes full BW+red buffers and uses triLUT + 0xC7 (custom LUT, Mode 1).
-// No clearing phases — each pixel is directly driven to its target voltage,
-// so unchanged pixels don't flash. RAM is written once; the display update
-// is triggered 3 times to build up red pigment saturation (~9s total vs
-// ~15s for OTP). The OTP-loaded voltage registers persist from the initial
-// 0xF7 and are reused.
+// Writes full BW+red buffers and triggers buildTriLUT + 0xC7 (custom LUT,
+// Mode 1) once. No clearing phases — each pixel is directly driven to its
+// target voltage, so unchanged pixels don't flash. Red pigment saturation is
+// built up by the interleaved red groups inside the LUT (triPasses × redRP —
+// the multi-trigger loop of CLUE-FW-19 folded into one activation, saving
+// two power-up/power-down cycles). The OTP-loaded voltage registers persist
+// from the initial 0xF7 and are reused.
 func (d *EPD) refreshTriColor() error {
 	d.wake()
 	d.setWindow(0, 0, epdW-1, epdH-1)
@@ -321,24 +355,17 @@ func (d *EPD) refreshTriColor() error {
 	d.cmd(0x26)
 	d.dataBlock(d.redBuffer[:])
 
+	lut := buildTriLUT(triPasses, redRP)
 	d.cmd(0x32)
-	d.dataBlock(triLUT[:])
+	d.dataBlock(lut[:])
 
-	totalMS := 0
-	timedOut := false
-	for pass := 0; pass < 3; pass++ {
-		d.cmd(0x22)
-		d.data(0xC7) // custom LUT + Mode 1 + display + power down
-		d.cmd(0x20)
+	d.cmd(0x22)
+	d.data(0xC7) // custom LUT + Mode 1 + display + power down
+	d.cmd(0x20)
 
-		ms, to := d.waitBusy(25000)
-		totalMS += ms
-		if to {
-			timedOut = true
-		}
-	}
+	ms, timedOut := d.waitBusy(25000)
 
-	d.LastRefreshMS = totalMS
+	d.LastRefreshMS = ms
 	d.LastTimeout = timedOut
 	d.DiffCount++
 	d.LastTier = "tri"
@@ -349,12 +376,14 @@ func (d *EPD) refreshTriColor() error {
 }
 
 // refreshPartialBW does a full-screen Mode 1 refresh for B/W-only changes.
-// Uses diffLUT + 0xC7 (custom LUT, Mode 1) — the same mode as OTP and
+// Uses buildDiffLUT + 0xC7 (custom LUT, Mode 1) — the same mode as OTP and
 // refreshTriColor, avoiding Mode 2's controller-state sensitivity that
 // caused B/W inversion after OTP refreshes. Writes the NEW B/W frame to
 // 0x24 and the red buffer (all zeros for <80% usage) to 0x26. In Mode 1,
-// LUT0 (R=0,BW=0)→VSL→black and LUT1 (R=0,BW=1)→VSH1→white. All pixels
-// are driven to their target state (reinforcement prevents fading).
+// LUT0 (R=0,BW=0)→VSH1→black and LUT1 (R=0,BW=1)→VSL→white (this panel's
+// polarity). All pixels are driven to their target state bwReps times in a
+// single activation (reinforcement prevents fading) — the 5-trigger loop of
+// CLUE-FW-19 folded into the LUT's repeat count, saving four power cycles.
 func (d *EPD) refreshPartialBW() error {
 	d.wake()
 	d.setWindow(0, 0, epdW-1, epdH-1)
@@ -368,24 +397,17 @@ func (d *EPD) refreshPartialBW() error {
 	d.cmd(0x26)
 	d.dataBlock(d.redBuffer[:])
 
+	lut := buildDiffLUT(bwReps)
 	d.cmd(0x32)
-	d.dataBlock(diffLUT[:])
+	d.dataBlock(lut[:])
 
-	totalMS := 0
-	timedOut := false
-	for pass := 0; pass < 5; pass++ {
-		d.cmd(0x22)
-		d.data(0xC7) // custom LUT + Mode 1 + display + power down
-		d.cmd(0x20)
+	d.cmd(0x22)
+	d.data(0xC7) // custom LUT + Mode 1 + display + power down
+	d.cmd(0x20)
 
-		ms, to := d.waitBusy(25000)
-		totalMS += ms
-		if to {
-			timedOut = true
-		}
-	}
+	ms, timedOut := d.waitBusy(25000)
 
-	d.LastRefreshMS = totalMS
+	d.LastRefreshMS = ms
 	d.LastTimeout = timedOut
 	d.DiffCount++
 	d.LastTier = "bw"
@@ -419,7 +441,7 @@ func (d *EPD) Size() (int16, int16) {
 }
 
 // wake brings the controller out of standby. Every refresh sequence
-// (0xF7/0xCF/0xC7) ends by disabling clock+analog, leaving the SSD1680 in
+// (0xF7/0xC7) ends by disabling clock+analog, leaving the SSD1680 in
 // standby where register and RAM writes are silently ignored. This must be
 // called before any SPI writes that follow a completed refresh.
 func (d *EPD) wake() {
@@ -434,21 +456,21 @@ func (d *EPD) wake() {
 // since 0xF7 may modify registers beyond cmd 0x21. Voltage registers
 // (0x03/0x04/0x2C) are NOT touched — they persist from the OTP load.
 func (d *EPD) initRegisters() {
-	d.cmd(0x01) // driver output control
+	d.cmd(0x01)  // driver output control
 	d.data(0x27) // (296-1) & 0xFF
 	d.data(0x01) // (296-1) >> 8
 	d.data(0x00)
 
-	d.cmd(0x11) // data entry mode
+	d.cmd(0x11)  // data entry mode
 	d.data(0x03) // X inc, Y inc
 
 	d.cmd(0x3C) // border waveform
 	d.data(0x05)
 
-	d.cmd(0x18) // temperature sensor
+	d.cmd(0x18)  // temperature sensor
 	d.data(0x80) // internal
 
-	d.cmd(0x21) // display update control 1
+	d.cmd(0x21)  // display update control 1
 	d.data(0x00) // A: normal BW + red RAM (no inversion)
 	d.data(0x80) // B[7]=1: source output S8-S167 (matches 128px panel)
 
