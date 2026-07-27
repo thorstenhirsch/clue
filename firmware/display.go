@@ -14,6 +14,10 @@ var (
 	white = color.RGBA{255, 255, 255, 255}
 	red   = color.RGBA{255, 0, 0, 255}
 	font  = &proggy.TinySZ8pt7b
+
+	displayHeadline  = "CLUE"
+	setupDescription = "Coding Agent Usage Display"
+	reauthentication = "Run host login to re-auth"
 )
 
 const (
@@ -209,7 +213,7 @@ func renderSetupScreen(d *EPD) {
 	tinydraw.FilledRectangle(d, marginX, 34, 60, 2, black)
 	tinyfont.WriteLine(d, font, marginX, 54, setupDescription, black)
 	tinyfont.WriteLine(d, font, marginX, 76, "Waiting for host daemon.", black)
-	tinyfont.WriteLine(d, font, marginX, 96, "Run: ./clue", black)
+	tinyfont.WriteLine(d, font, marginX, 96, "Run a provider host binary.", black)
 }
 
 func renderConnectingScreen(d *EPD) {

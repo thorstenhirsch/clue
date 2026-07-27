@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-E-ink display that shows Claude Code or OpenAI Codex rate-limit usage. Claude is the default build target; `PROVIDER=codex` selects Codex. Two components communicate over USB serial:
+E-ink display that shows Claude Code or OpenAI Codex rate-limit usage. Firmware is universal and both provider-specific host binaries are built by default. Two components communicate over USB serial:
 
 - **firmware/** — TinyGo firmware for a nice!nano driving a WeAct Studio 2.9" tri-color (BWR) e-ink display (SSD1680)
 - **cmd/clue/** — shared host daemon with build-tagged provider selection
@@ -15,12 +15,12 @@ E-ink display that shows Claude Code or OpenAI Codex rate-limit usage. Claude is
 ## Build Commands
 
 ```
-make clue          # go build → clue binary
+make clue          # build clue-claude and clue-codex
+make clue-claude   # Claude host only
+make clue-codex    # Codex host only
 make firmware      # tinygo build → clue.uf2
 make flash         # tinygo flash directly to connected nice!nano
-make all           # firmware + clue
-make PROVIDER=codex all # Codex firmware + clue
-make codex         # shorthand for the Codex all build
+make all           # universal firmware + both host binaries
 make clean         # remove artifacts
 ```
 
@@ -42,6 +42,7 @@ Newline-delimited ASCII messages between device and host:
 | Device→Host | `N` | No token stored |
 | Host→Device | `U:pUsed:pLimit:sUsed:sLimit:pResetMin:sResetDay:sResetMin:pResetDay:pWindowMin:sWindowMin` | Usage data; final 3 fields extend the legacy protocol |
 | Host→Device | `E` | Auth error — token expired |
+| Host→Device | `A:claude\|codex` | Select runtime headline and authentication text |
 | Host→Device | `F` | Force full OTP refresh with current data |
 | Host→Device | `G` | Request token/status |
 | Host→Device | `M:0\|1` | Fast-full mode: 1=RefreshSmart-internal fulls (anti-ghost, red-cleared) use temp-spoofed 90°C OTP waveform (default), 0=all fulls use true OTP 0xF7 |
@@ -52,7 +53,7 @@ Newline-delimited ASCII messages between device and host:
 
 Reset minutes are local minute-of-day (0-1439, or -1), reset days use 0=Sun..6=Sat, and window durations are minutes. Firmware still accepts the legacy seven-field payload and defaults its durations to 5 hours and 1 week.
 
-## Host Daemon (`./clue`)
+## Host Daemons (`./clue-claude`, `./clue-codex`)
 
 - Waits for serial device to appear (polls every 2s) — can be started before plugging in the nice!nano
 - Resilient to USB disconnect/reconnect: detects serial I/O errors, closes the port, and loops back to device detection. Designed to run as a long-lived systemd service

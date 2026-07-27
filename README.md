@@ -1,6 +1,6 @@
 # CLUE — Coding-agent usage on e-ink
 
-A physical e-ink display connected to a nice!nano (nRF52840) that shows either Claude Code or OpenAI Codex rate-limit usage. Claude Code is the default build target; Codex is selected at build time.
+A physical e-ink display connected to a nice!nano (nRF52840) that shows either Claude Code or OpenAI Codex rate-limit usage. The firmware is provider-independent, and `make all` builds one explicitly named host binary for each provider.
 
 ```
 ┌──────────────────────────────────────────┐
@@ -51,8 +51,8 @@ Put your nice!nano into bootloader mode (double-tap reset), then build and flash
 
 ```sh
 make flash
-make clue
-./clue
+make clue-claude
+./clue-claude
 ```
 
 Or build the UF2 and copy it manually:
@@ -72,20 +72,19 @@ Configure Codex to keep its cached login in a file:
 cli_auth_credentials_store = "file"
 ```
 
-Then authenticate and build both components with the same provider:
+Then authenticate and build the Codex host binary. The same firmware works for both providers:
 
 ```sh
 codex login
-make PROVIDER=codex flash
-make PROVIDER=codex clue
-./clue
+make codex
+./clue-codex
 ```
 
-`make codex` is a shortcut for building both Codex artifacts. `PROVIDER=codex make all` is equivalent to `make PROVIDER=codex all`.
+Flash the firmware once with `make flash`. Switching providers later only requires running `./clue-claude` or `./clue-codex`; the selected host announces its provider over serial and the display updates its branding automatically. `make all` builds the universal firmware and both host binaries, with no provider argument required.
 
 ## Using clue
 
-`clue` is the host-side daemon that polls the selected provider and sends rate-limit data to the device over USB serial. It is resilient to USB disconnect/reconnect: if the nice!nano is unplugged, `clue` closes the port and waits for the device to reappear.
+`clue-claude` and `clue-codex` are host-side daemons that poll their respective providers and send rate-limit data to the device over USB serial. They are resilient to USB disconnect/reconnect: if the nice!nano is unplugged, the daemon closes the port and waits for the device to reappear.
 
 The reading-light LED is off at boot. It turns on when a host daemon connects and turns off after 60 seconds without host traffic, including when `clue` is killed without a graceful shutdown.
 
@@ -116,10 +115,10 @@ For Codex, run `codex login`. The display uses provider-specific recovery text i
 
 ```sh
 # Auto-detect port
-./clue
+./clue-claude
 
 # Specify port
-./clue --port /dev/ttyACM0
+./clue-codex --port /dev/ttyACM0
 ```
 
 ### Running as a systemd service
@@ -133,7 +132,7 @@ Description=Coding-agent usage e-ink display
 After=default.target
 
 [Service]
-ExecStart=%h/path/to/clue
+ExecStart=%h/path/to/clue-claude
 Restart=on-failure
 RestartSec=10
 
@@ -150,12 +149,12 @@ systemctl --user enable --now clue
 
 | Command | Description |
 |---------|-------------|
-| `make all` | Build Claude firmware and host daemon |
-| `make PROVIDER=codex all` | Build Codex firmware and host daemon |
-| `make codex` | Shortcut for the Codex `all` build |
-| `make clue` | Build the selected host daemon |
-| `make firmware` | Build selected firmware → `clue.uf2` |
-| `make flash` | Flash selected firmware to nice!nano |
+| `make all` | Build universal firmware, `clue-claude`, and `clue-codex` |
+| `make clue` | Build both provider-specific host binaries |
+| `make clue-claude` / `make claude` | Build only the Claude host binary |
+| `make clue-codex` / `make codex` | Build only the Codex host binary |
+| `make firmware` | Build universal firmware → `clue.uf2` |
+| `make flash` | Flash universal firmware to nice!nano |
 | `make test` | Test both host provider variants |
 | `make clean` | Remove build artifacts |
 
@@ -166,5 +165,5 @@ cmd/clue/        Shared host daemon plus build-tagged provider selection
 provider/        Provider-neutral usage types and interface
 claude/          Claude credential loader and API client
 codex/           Codex credential loader and usage client
-firmware/        Shared TinyGo display/serial code plus build-tagged branding
+firmware/        Universal TinyGo display and serial firmware
 ```

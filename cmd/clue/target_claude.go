@@ -9,4 +9,7 @@ import (
 
 var activeProvider provider.Provider = claude.NewProvider()
 
-const authCommand = "claude"
+const (
+	authCommand = "claude"
+	providerID  = "claude"
+)

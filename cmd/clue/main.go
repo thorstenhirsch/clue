@@ -126,6 +126,9 @@ func runSession(portName string, sigCh <-chan os.Signal) error {
 			lastG = time.Now()
 		}
 	}
+	if err := sendLine(port, "A:"+providerID); err != nil {
+		return fmt.Errorf("provider handshake: %w", err)
+	}
 
 	disconnected := make(chan struct{})
 	go func() {

@@ -9,4 +9,7 @@ import (
 
 var activeProvider provider.Provider = codex.NewClient()
 
-const authCommand = "codex login"
+const (
+	authCommand = "codex login"
+	providerID  = "codex"
+)

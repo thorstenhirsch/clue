@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	buildID        = "CLUE-FW-23"
+	buildID        = "CLUE-FW-24"
 	hostLEDTimeout = 60 * time.Second
 )
 
@@ -118,6 +118,9 @@ func handleMessage(line string) {
 		currentState = stateError
 		showError(&display)
 
+	case strings.HasPrefix(line, "A:"):
+		setProvider(line[2:])
+
 	case strings.HasPrefix(line, "S:"):
 		token := line[2:]
 		if err := writeToken(token); err != nil {
@@ -185,6 +188,19 @@ func noteHostActivity() {
 	if !hostActive {
 		led.High()
 		hostActive = true
+	}
+}
+
+func setProvider(id string) {
+	switch id {
+	case "claude":
+		displayHeadline = "CLAUDE PRO"
+		setupDescription = "Claude Usage E-Ink Display"
+		reauthentication = "Run 'claude' to re-authenticate"
+	case "codex":
+		displayHeadline = "OPENAI CODEX"
+		setupDescription = "Codex Usage E-Ink Display"
+		reauthentication = "Run 'codex login' to re-auth"
 	}
 }
 
