@@ -8,39 +8,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/thorstenhirsch/clue/provider"
 )
 
-const apiURL = "https://api.anthropic.com"
-
-type UsageData struct {
-	H5Used  int64
-	H5Limit int64
-	W1Used  int64
-	W1Limit int64
-	H5Reset time.Time // absolute 5-hour reset time (zero = unknown)
-	W1Reset time.Time // absolute 7-day reset time (zero = unknown)
-}
+const defaultAPIURL = "https://api.anthropic.com"
 
 type Client struct {
 	accessToken string
+	apiURL      string
 	http        *http.Client
 }
 
 func NewClient(accessToken string) *Client {
 	return &Client{
 		accessToken: accessToken,
+		apiURL:      defaultAPIURL,
 		http:        &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-type ErrAuth struct{}
-
-func (ErrAuth) Error() string { return "authentication failed" }
-
 const probeBody = `{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
 
-func (c *Client) FetchUsage() (*UsageData, error) {
-	req, err := http.NewRequest("POST", apiURL+"/v1/messages", strings.NewReader(probeBody))
+func (c *Client) FetchUsage() (*provider.Usage, error) {
+	req, err := http.NewRequest("POST", c.apiURL+"/v1/messages", strings.NewReader(probeBody))
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +49,7 @@ func (c *Client) FetchUsage() (*UsageData, error) {
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, ErrAuth{}
+		return nil, provider.ErrAuth
 	}
 
 	h5util := parseHeaderFloat(resp.Header.Get("anthropic-ratelimit-unified-5h-utilization"))
@@ -71,13 +62,15 @@ func (c *Client) FetchUsage() (*UsageData, error) {
 	}
 
 	const scale = 10000
-	return &UsageData{
-		H5Used:  int64(math.Round(clamp01(h5util) * scale)),
-		H5Limit: scale,
-		W1Used:  int64(math.Round(clamp01(w1util) * scale)),
-		W1Limit: scale,
-		H5Reset: h5reset,
-		W1Reset: w1reset,
+	return &provider.Usage{
+		Primary: provider.Window{
+			Used: int64(math.Round(clamp01(h5util) * scale)), Limit: scale,
+			DurationMins: 5 * 60, Reset: h5reset,
+		},
+		Secondary: provider.Window{
+			Used: int64(math.Round(clamp01(w1util) * scale)), Limit: scale,
+			DurationMins: 7 * 24 * 60, Reset: w1reset,
+		},
 	}, nil
 }
 

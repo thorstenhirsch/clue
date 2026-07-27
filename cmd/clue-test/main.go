@@ -27,7 +27,11 @@ func main() {
 	portFlag := flag.String("port", "", "serial port (e.g. /dev/ttyACM0); auto-detected if empty")
 	pauseFlag := flag.Duration("pause", 3*time.Second, "viewing pause after refresh completes")
 	cmdFlag := flag.String("cmd", "", "send a single raw command line (e.g. \"X:6:2:4\" or \"M:1\"), print responses, exit")
+	providerFlag := flag.String("provider", "claude", "display provider branding: claude or codex")
 	flag.Parse()
+	if *providerFlag != "claude" && *providerFlag != "codex" {
+		log.Fatalf("Invalid provider %q; use claude or codex", *providerFlag)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -70,6 +74,7 @@ func main() {
 		return
 	}
 	log.Println("Device connected")
+	sendLine(port, "A:"+*providerFlag)
 
 	if *cmdFlag != "" {
 		log.Printf("-> %s", *cmdFlag)
@@ -83,7 +88,7 @@ func main() {
 	steps := []step{
 		// --- Sequence 1: full lifecycle ---
 		// LED is on from boot. First reading suppresses blink even though
-		// it's a "new" value — the sentinel H5Limit=-1 guard prevents it.
+		// it's a "new" value — the sentinel PrimaryLimit=-1 guard prevents it.
 		{label: "init 10/5 (expect: full, LED: no blink)", h5pct: 10, w1pct: 5, full: true},
 		{label: "update 50/20 (expect: bw)", h5pct: 50, w1pct: 20},
 		{label: "update 85/20 — h5 turns red (expect: full, LED: 3 blinks)", h5pct: 85, w1pct: 20, full: true, blink: 3},
@@ -145,7 +150,7 @@ func main() {
 				strconv.Itoa(limit) + ":" +
 				strconv.FormatInt(used1, 10) + ":" +
 				strconv.Itoa(limit) + ":" +
-				"870:3:870"
+				"870:3:870:3:300:10080"
 			sendLine(port, msg)
 		}
 

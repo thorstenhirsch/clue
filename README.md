@@ -1,22 +1,22 @@
-# CLUE - Claude Usage (on) E-Ink (display)
+# CLUE — Coding-agent usage on e-ink
 
-A physical e-ink display connected to a nice!nano (NRF52840) that shows your Claude Pro rate-limit usage in real time — 5-hour and weekly token windows, with segmented progress bars and reset countdowns.
+A physical e-ink display connected to a nice!nano (nRF52840) that shows either Claude Code or OpenAI Codex rate-limit usage. The firmware is provider-independent, and `make all` builds one explicitly named host binary for each provider.
 
 ```
 ┌──────────────────────────────────────────┐
-│ CLAUDE PRO                               │
+│ CLAUDE PRO / OPENAI CODEX                │
 │ ─────────────────────────────────────    │
 │ 5-HOUR                         14:30     │
 │ ▕█████████████         ▏ 48%             │
-│ 1.2M / 3.2M tokens                       │
+│ 48% RATE-LIMIT UTILIZATION               │
 │ - - - - - - - - - - - - - - - - - - - -  │
 │ WEEKLY                   Wed 14:30       │
 │ ▕██████████████████████▏ 85%             │
-│ 18.4M / 25.6M tokens                     │
+│ 85% RATE-LIMIT UTILIZATION               │
 └──────────────────────────────────────────┘
 ```
 
-Both sections render in **black** by default. When a section's usage reaches **≥80%**, its progress bar and title turn **red** using the tri-color e-ink display's native red channel. The percentage, reset time, and token stats always stay black for fast partial refresh.
+Both sections render in **black** by default. When a section's usage reaches **≥80%**, its progress bar and title turn **red** using the tri-color e-ink display's native red channel. Percentages, reset times, and utilization details stay black for fast partial refresh. Window labels come from the provider's reported duration (`5-HOUR`, `WEEKLY`, and so on).
 
 ## Hardware
 
@@ -40,16 +40,19 @@ Both sections render in **black** by default. When a section's usage reaches **�
 
 - [Go](https://go.dev/) (1.26+)
 - [TinyGo](https://tinygo.org/) (for firmware only)
-- [Claude Code](https://claude.ai/code) — you need to be logged in so that `~/.claude/.credentials.json` exists
+- For the default Claude build: [Claude Code](https://claude.ai/code), logged in so `~/.claude/.credentials.json` exists
+- For the Codex build: [Codex CLI](https://developers.openai.com/codex/cli), signed in with ChatGPT and configured for file credential storage
 
 ## Quick Start
 
-### 1. Flash the firmware
+### Claude Code (default)
 
-Put your nice!nano into bootloader mode (double-tap reset), then:
+Put your nice!nano into bootloader mode (double-tap reset), then build and flash:
 
 ```sh
 make flash
+make clue-claude
+./clue-claude
 ```
 
 Or build the UF2 and copy it manually:
@@ -60,22 +63,38 @@ make firmware
 cp clue.uf2 /run/media/${USER}/NICENANO/ && sync
 ```
 
-### 2. Build and run clue
+### OpenAI Codex
 
-```sh
-make clue
-./clue
+Configure Codex to keep its cached login in a file:
+
+```toml
+# ~/.codex/config.toml
+cli_auth_credentials_store = "file"
 ```
 
-That's it. `clue` reads your Claude credentials automatically and starts pushing usage data to the display.
+Then authenticate and build the Codex host binary. The same firmware works for both providers:
+
+```sh
+codex login
+make codex
+./clue-codex
+```
+
+Flash the firmware once with `make flash`. Switching providers later only requires running `./clue-claude` or `./clue-codex`; the selected host announces its provider over serial and the display updates its branding automatically. `make all` builds the universal firmware and both host binaries, with no provider argument required.
 
 ## Using clue
 
-`clue` (**cl**aude **u**sage **e**-ink) is the host-side daemon that polls the Claude API and sends rate-limit data to the device over USB serial. It is resilient to USB disconnect/reconnect — if the nice!nano is unplugged, `clue` detects the serial I/O error, closes the port, and waits for the device to reappear. No restart needed.
+`clue-claude` and `clue-codex` are host-side daemons that poll their respective providers and send rate-limit data to the device over USB serial. They are resilient to USB disconnect/reconnect: if the nice!nano is unplugged, the daemon closes the port and waits for the device to reappear.
+
+The reading-light LED is off at boot. It turns on when a host daemon connects and turns off after 60 seconds without host traffic, including when `clue` is killed without a graceful shutdown.
 
 ### How authentication works
 
-`clue` reads OAuth credentials from `~/.claude/.credentials.json` — the same file that [Claude Code](https://claude.ai/code) writes when you log in. No API keys, no manual token setup. If you're logged into Claude Code, `clue` just works.
+The Claude build reads OAuth credentials from `~/.claude/.credentials.json`, the same file Claude Code writes.
+
+The Codex build reads `$CODEX_HOME/auth.json` (or `~/.codex/auth.json`) and requires ChatGPT subscription login. It intentionally does not support API-key login, because API usage has different rate limits, or keyring-only storage, because `clue` never asks Codex to export secrets. It only reads credentials and never refreshes or rewrites them.
+
+Codex usage is read from the same `GET /backend-api/wham/usage` route used by the current open-source Codex client. This direct route is not a public API and may change in a future Codex release; all related code is isolated in the `codex` package.
 
 If the token has expired, `clue` will tell you — both in the terminal and on the e-ink display:
 
@@ -84,26 +103,22 @@ Access token expired at 2026-06-19T18:27:11+02:00.
 Run 'claude' to refresh.
 ```
 
-The display shows "Token Expired or Revoked" / "Run 'claude' to re-authenticate" in black text (fast refresh, no red ink). Just open Claude Code to refresh the token, then restart `clue`.
+For Codex, run `codex login`. The display uses provider-specific recovery text in black, preserving the fast error refresh.
 
 ### Flags
 
 ```
 --port string    Serial port (e.g. /dev/ttyACM0). Auto-detected if omitted.
---interval dur   Polling interval (default 30s).
 ```
 
 ### Examples
 
 ```sh
-# Auto-detect port, poll every 30s (default)
-./clue
+# Auto-detect port
+./clue-claude
 
-# Specify port and poll every minute
-./clue --port /dev/ttyACM0 --interval 1m
-
-# Fast updates
-./clue --interval 10s
+# Specify port
+./clue-codex --port /dev/ttyACM0
 ```
 
 ### Running as a systemd service
@@ -113,11 +128,11 @@ The display shows "Token Expired or Revoked" / "Run 'claude' to re-authenticate"
 ```ini
 # ~/.config/systemd/user/clue.service
 [Unit]
-Description=Claude usage e-ink display
+Description=Coding-agent usage e-ink display
 After=default.target
 
 [Service]
-ExecStart=%h/path/to/clue
+ExecStart=%h/path/to/clue-claude
 Restart=on-failure
 RestartSec=10
 
@@ -132,18 +147,23 @@ systemctl --user enable --now clue
 
 ## Build Targets
 
-| Command        | Description                              |
-|----------------|------------------------------------------|
-| `make all`     | Build firmware and clue                  |
-| `make clue`    | Build the host daemon                    |
-| `make firmware`| Build firmware → `clue.uf2`              |
-| `make flash`   | Flash firmware directly to nice!nano     |
-| `make clean`   | Remove build artifacts                   |
+| Command | Description |
+|---------|-------------|
+| `make all` | Build universal firmware, `clue-claude`, and `clue-codex` |
+| `make clue` | Build both provider-specific host binaries |
+| `make clue-claude` / `make claude` | Build only the Claude host binary |
+| `make clue-codex` / `make codex` | Build only the Codex host binary |
+| `make firmware` | Build universal firmware → `clue.uf2` |
+| `make flash` | Flash universal firmware to nice!nano |
+| `make test` | Test both host provider variants |
+| `make clean` | Remove build artifacts |
 
 ## Project Structure
 
 ```
-cmd/clue/        Host daemon — reads credentials, polls API, sends data over serial
-claude/          Go package — API client and credential loader
-firmware/        TinyGo firmware — display rendering and serial protocol
+cmd/clue/        Shared host daemon plus build-tagged provider selection
+provider/        Provider-neutral usage types and interface
+claude/          Claude credential loader and API client
+codex/           Codex credential loader and usage client
+firmware/        Universal TinyGo display and serial firmware
 ```

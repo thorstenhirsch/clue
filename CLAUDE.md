@@ -4,19 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-E-ink display that shows Claude Pro rate-limit usage (5-hour and weekly token windows). Two components communicate over USB serial:
+E-ink display that shows Claude Code or OpenAI Codex rate-limit usage. Firmware is universal and both provider-specific host binaries are built by default. Two components communicate over USB serial:
 
 - **firmware/** — TinyGo firmware for a nice!nano driving a WeAct Studio 2.9" tri-color (BWR) e-ink display (SSD1680)
-- **cmd/clue/** — host daemon ("**cl**aude **u**sage **e**-ink") that reads OAuth credentials from `~/.claude/.credentials.json`, polls the Anthropic API for rate-limit utilization, and pushes usage data to the device over serial
+- **cmd/clue/** — shared host daemon with build-tagged provider selection
+- **provider/** — provider-neutral usage windows and interface
 - **claude/** — Go package: API client (`client.go`) and credential loader (`credentials.go`)
+- **codex/** — Go package: read-only Codex credential loader and direct usage client
 
 ## Build Commands
 
 ```
-make clue          # go build → clue binary
+make clue          # build clue-claude and clue-codex
+make clue-claude   # Claude host only
+make clue-codex    # Codex host only
 make firmware      # tinygo build → clue.uf2
 make flash         # tinygo flash directly to connected nice!nano
-make all           # firmware + clue
+make all           # universal firmware + both host binaries
 make clean         # remove artifacts
 ```
 
@@ -26,7 +30,7 @@ The firmware uses a **separate** `go.mod` under `firmware/` (TinyGo-specific dep
 
 ## Authentication & Usage Data
 
-`clue` reads OAuth credentials from `~/.claude/.credentials.json` (the same file Claude Code writes). To get rate-limit utilization, it makes a minimal `POST /v1/messages` call to `api.anthropic.com` (1 token of Haiku, essentially free) and reads the undocumented `anthropic-ratelimit-unified-*` response headers for 5-hour and 7-day utilization percentages. No separate usage API endpoint is needed. If the token is expired, the user just runs `claude` to refresh it.
+The Claude provider reads `~/.claude/.credentials.json`, makes a minimal `POST /v1/messages`, and reads the `anthropic-ratelimit-unified-*` response headers. The Codex provider reads `$CODEX_HOME/auth.json` or `~/.codex/auth.json`, requires ChatGPT/file-store auth, and calls `GET https://chatgpt.com/backend-api/wham/usage`. It never refreshes or writes credentials. The direct Codex route is an internal compatibility boundary and must stay isolated in `codex/`.
 
 ## Serial Protocol
 
@@ -36,8 +40,9 @@ Newline-delimited ASCII messages between device and host:
 |-----------|---------|---------|
 | Device→Host | `R` | Device ready (has stored token) |
 | Device→Host | `N` | No token stored |
-| Host→Device | `U:h5used:h5limit:w1used:w1limit:h5resetMin:w1resetDay:w1resetMin` | Usage data (7 int64 fields) |
+| Host→Device | `U:pUsed:pLimit:sUsed:sLimit:pResetMin:sResetDay:sResetMin:pResetDay:pWindowMin:sWindowMin` | Usage data; final 3 fields extend the legacy protocol |
 | Host→Device | `E` | Auth error — token expired |
+| Host→Device | `A:claude\|codex` | Select runtime headline and authentication text |
 | Host→Device | `F` | Force full OTP refresh with current data |
 | Host→Device | `G` | Request token/status |
 | Host→Device | `M:0\|1` | Fast-full mode: 1=RefreshSmart-internal fulls (anti-ghost, red-cleared) use temp-spoofed 90°C OTP waveform (default), 0=all fulls use true OTP 0xF7 |
@@ -46,15 +51,16 @@ Newline-delimited ASCII messages between device and host:
 
 `./clue-test -cmd "X:6:2:4"` sends a single raw command and prints responses (stop the `clue` daemon first).
 
-Reset fields: `h5resetMin` = minute-of-day (0-1439, or -1), `w1resetDay` = weekday (0=Sun..6=Sat, or -1), `w1resetMin` = minute-of-day. The host computes these from the API's RFC3339 reset timestamps and sends absolute local clock times so the firmware doesn't need an RTC.
+Reset minutes are local minute-of-day (0-1439, or -1), reset days use 0=Sun..6=Sat, and window durations are minutes. Firmware still accepts the legacy seven-field payload and defaults its durations to 5 hours and 1 week.
 
-## Host Daemon (`./clue`)
+## Host Daemons (`./clue-claude`, `./clue-codex`)
 
 - Waits for serial device to appear (polls every 2s) — can be started before plugging in the nice!nano
 - Resilient to USB disconnect/reconnect: detects serial I/O errors, closes the port, and loops back to device detection. Designed to run as a long-lived systemd service
 - Polls API every 30s, only sends data when usage actually changes
 - Nightly 4am full OTP refresh (`F` command) to clear e-ink ghosting
 - Reset time log lines only printed when the 5h reset time changes
+- Reading-light LED defaults off, turns on when host traffic is received, and turns off after 60 seconds without host traffic; graceful shutdown still sends `L:0`
 
 ## Display Architecture
 
@@ -77,7 +83,7 @@ Reset fields: `h5resetMin` = minute-of-day (0-1439, or -1), `w1resetDay` = weekd
 - **All custom refreshes use Mode 1 (`0xC7`)** — Mode 2 (`0xCF`, differential) was abandoned because its LUT index mapping depends on controller state that the OTP modifies unpredictably, causing B/W inversion on the first custom refresh after any 0xF7
 - **Controller standby**: every refresh sequence (0xF7/0xC7) ends by disabling clock+analog. All refresh functions call `wake()` (0xC0 + master activation) before SPI writes. `DisplayFull` also calls `initRegisters()` after OTP to reset any registers the OTP modified
 - **Critical voltage register insight**: the SSD1680 automatically loads VGH/VSH/VSL/VCOM from OTP during any 0xF7 refresh. These values persist in the registers. Custom LUTs (cmd 0x32 + 0xC7) reuse them — **never write 0x03/0x04/0x2C/0x3F manually**
-- **Error display**: auth errors (`E` command) render in black-only text ("Token Expired or Revoked" / "Run 'claude' to re-authenticate") via `RefreshSmart()` — fast B/W partial, no red ink, no full OTP needed
+- **Error display**: auth errors (`E` command) render provider-specific recovery text in black via `RefreshSmart()` — fast B/W partial, no red ink, no full OTP needed
 
 ## Flash Token Storage
 
