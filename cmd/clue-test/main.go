@@ -83,7 +83,7 @@ func main() {
 	steps := []step{
 		// --- Sequence 1: full lifecycle ---
 		// LED is on from boot. First reading suppresses blink even though
-		// it's a "new" value — the sentinel H5Limit=-1 guard prevents it.
+		// it's a "new" value — the sentinel PrimaryLimit=-1 guard prevents it.
 		{label: "init 10/5 (expect: full, LED: no blink)", h5pct: 10, w1pct: 5, full: true},
 		{label: "update 50/20 (expect: bw)", h5pct: 50, w1pct: 20},
 		{label: "update 85/20 — h5 turns red (expect: full, LED: 3 blinks)", h5pct: 85, w1pct: 20, full: true, blink: 3},
@@ -145,7 +145,7 @@ func main() {
 				strconv.Itoa(limit) + ":" +
 				strconv.FormatInt(used1, 10) + ":" +
 				strconv.Itoa(limit) + ":" +
-				"870:3:870"
+				"870:3:870:3:300:10080"
 			sendLine(port, msg)
 		}
 

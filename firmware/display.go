@@ -48,21 +48,24 @@ var bigGlyphs = [11][7]uint8{
 }
 
 type UsageData struct {
-	H5Used     int64
-	H5Limit    int64
-	W1Used     int64
-	W1Limit    int64
-	H5ResetMin int64 // minutes-of-day 0–1439, or -1 = unknown
-	W1ResetDay int64 // weekday 0=Sun..6=Sat, or -1 = unknown
-	W1ResetMin int64 // minutes-of-day 0–1439, or -1 = unknown
+	PrimaryUsed        int64
+	PrimaryLimit       int64
+	SecondaryUsed      int64
+	SecondaryLimit     int64
+	PrimaryResetDay    int64 // weekday 0=Sun..6=Sat, or -1 = unknown
+	PrimaryResetMin    int64 // minutes-of-day 0–1439, or -1 = unknown
+	SecondaryResetDay  int64 // weekday 0=Sun..6=Sat, or -1 = unknown
+	SecondaryResetMin  int64 // minutes-of-day 0–1439, or -1 = unknown
+	PrimaryWindowMin   int64
+	SecondaryWindowMin int64
 }
 
 // barTurnsRed returns true if any section's bar switches from black (<80%)
 // to red (≥80%). A no-clear tri-color refresh can't transition black→red —
 // the caller should force a full OTP refresh instead.
 func barTurnsRed(old, cur *UsageData) bool {
-	return pct(old.H5Used, old.H5Limit) < 80 && pct(cur.H5Used, cur.H5Limit) >= 80 ||
-		pct(old.W1Used, old.W1Limit) < 80 && pct(cur.W1Used, cur.W1Limit) >= 80
+	return pct(old.PrimaryUsed, old.PrimaryLimit) < 80 && pct(cur.PrimaryUsed, cur.PrimaryLimit) >= 80 ||
+		pct(old.SecondaryUsed, old.SecondaryLimit) < 80 && pct(cur.SecondaryUsed, cur.SecondaryLimit) >= 80
 }
 
 func pct(used, limit int64) int64 {
@@ -78,14 +81,14 @@ func pct(used, limit int64) int64 {
 
 // blinkCount returns how many times the alert LED should blink for thresholds
 // crossed between old and cur. Hitting 100% on either window blinks 5; the
-// 5-hour window crossing 80% blinks 3. Weekly 80% is intentionally ignored.
-// The very first reading after boot (sentinel old.H5Limit < 0) never blinks.
+// primary window crossing 80% blinks 3. Secondary 80% is intentionally ignored.
+// The very first reading after boot (sentinel old.PrimaryLimit < 0) never blinks.
 func blinkCount(old, cur *UsageData) int {
-	if old.H5Limit < 0 {
+	if old.PrimaryLimit < 0 {
 		return 0
 	}
-	h5o, h5n := pct(old.H5Used, old.H5Limit), pct(cur.H5Used, cur.H5Limit)
-	w1o, w1n := pct(old.W1Used, old.W1Limit), pct(cur.W1Used, cur.W1Limit)
+	h5o, h5n := pct(old.PrimaryUsed, old.PrimaryLimit), pct(cur.PrimaryUsed, cur.PrimaryLimit)
+	w1o, w1n := pct(old.SecondaryUsed, old.SecondaryLimit), pct(cur.SecondaryUsed, cur.SecondaryLimit)
 	switch {
 	case h5o < 100 && h5n >= 100:
 		return 5
@@ -101,22 +104,19 @@ func renderUsageScreen(d *EPD, u *UsageData) {
 	d.ClearBuffer()
 
 	// Header
-	tinyfont.WriteLine(d, font, marginX, 12, "CLAUDE PRO", black)
+	tinyfont.WriteLine(d, font, marginX, 12, displayHeadline, black)
 	tinydraw.FilledRectangle(d, marginX, 16, screenW-2*marginX, 2, black)
 
-	// 5-hour section — reset as "HH:MM"
-	h5reset := formatClock(u.H5ResetMin)
-	drawSection(d, 29, "5-HOUR", u.H5Used, u.H5Limit, h5reset)
+	primaryReset := formatReset(u.PrimaryResetDay, u.PrimaryResetMin, u.PrimaryWindowMin)
+	drawSection(d, 29, formatWindowLabel(u.PrimaryWindowMin, "PRIMARY"),
+		u.PrimaryUsed, u.PrimaryLimit, primaryReset)
 
 	// Divider
 	drawDashedLine(d, marginX, 73, screenW-marginX)
 
-	// Weekly section — reset as "Ddd HH:MM"
-	w1reset := ""
-	if u.W1ResetDay >= 0 && u.W1ResetMin >= 0 {
-		w1reset = weekdayAbbrev(u.W1ResetDay) + " " + formatClock(u.W1ResetMin)
-	}
-	drawSection(d, 84, "WEEKLY", u.W1Used, u.W1Limit, w1reset)
+	secondaryReset := formatReset(u.SecondaryResetDay, u.SecondaryResetMin, u.SecondaryWindowMin)
+	drawSection(d, 84, formatWindowLabel(u.SecondaryWindowMin, "SECONDARY"),
+		u.SecondaryUsed, u.SecondaryLimit, secondaryReset)
 }
 
 func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLabel string) {
@@ -128,7 +128,7 @@ func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLab
 		pct = 100
 	}
 
-	// Bar+title turn red at ≥80% usage. Big %, reset time, and token stats
+	// Bar+title turn red at ≥80% usage. Big %, reset time, and detail text
 	// always stay black so they can update via fast B/W partial refresh.
 	barCol := black
 	if pct >= 80 {
@@ -160,9 +160,10 @@ func drawSection(d *EPD, labelY int16, label string, used, limit int64, resetLab
 	pctY := barY + (int16(barH)-int16(digitH))/2
 	drawBigPercent(d, pctX, pctY, pct, black)
 
-	// Token detail line below bar
+	// Provider APIs report rate-limit utilization, not actual token counts.
 	detailY := barY + barH + 8
-	tinyfont.WriteLine(d, font, marginX, detailY, formatTokens(used)+" / "+formatTokens(limit)+" tokens", black)
+	tinyfont.WriteLine(d, font, marginX, detailY,
+		strconv.FormatInt(pct, 10)+"% RATE-LIMIT UTILIZATION", black)
 }
 
 func drawBigPercent(d *EPD, x, y int16, value int64, col color.RGBA) {
@@ -199,14 +200,14 @@ func renderErrorScreen(d *EPD) {
 	d.ClearBuffer()
 	tinyfont.WriteLine(d, font, marginX, 50, "Token Expired or Revoked", black)
 	tinydraw.FilledRectangle(d, marginX, 54, 144, 2, black)
-	tinyfont.WriteLine(d, font, marginX, 74, "Run 'claude' to re-authenticate", black)
+	tinyfont.WriteLine(d, font, marginX, 74, reauthentication, black)
 }
 
 func renderSetupScreen(d *EPD) {
 	d.ClearBuffer()
 	tinyfont.WriteLine(d, font, marginX, 30, "CLUE READY", black)
 	tinydraw.FilledRectangle(d, marginX, 34, 60, 2, black)
-	tinyfont.WriteLine(d, font, marginX, 54, "Claude Usage E-Ink Display", black)
+	tinyfont.WriteLine(d, font, marginX, 54, setupDescription, black)
 	tinyfont.WriteLine(d, font, marginX, 76, "Waiting for host daemon.", black)
 	tinyfont.WriteLine(d, font, marginX, 96, "Run: ./clue", black)
 }
@@ -228,17 +229,30 @@ func drawDashedLine(d *EPD, x1, y, x2 int16) {
 	}
 }
 
-func formatTokens(n int64) string {
-	if n >= 1_000_000_000 {
-		return strconv.FormatInt(n/1_000_000_000, 10) + "." + strconv.FormatInt((n%1_000_000_000)/100_000_000, 10) + "B"
+func formatWindowLabel(minutes int64, fallback string) string {
+	switch {
+	case minutes == 7*24*60:
+		return "WEEKLY"
+	case minutes > 0 && minutes%(24*60) == 0:
+		return strconv.FormatInt(minutes/(24*60), 10) + "-DAY"
+	case minutes > 0 && minutes%60 == 0:
+		return strconv.FormatInt(minutes/60, 10) + "-HOUR"
+	case minutes > 0:
+		return strconv.FormatInt(minutes, 10) + "-MIN"
+	default:
+		return fallback
 	}
-	if n >= 1_000_000 {
-		return strconv.FormatInt(n/1_000_000, 10) + "." + strconv.FormatInt((n%1_000_000)/100_000, 10) + "M"
+}
+
+func formatReset(day, minute, windowMinutes int64) string {
+	if minute < 0 {
+		return ""
 	}
-	if n >= 1_000 {
-		return strconv.FormatInt(n/1_000, 10) + "." + strconv.FormatInt((n%1_000)/100, 10) + "K"
+	clock := formatClock(minute)
+	if windowMinutes >= 24*60 && day >= 0 {
+		return weekdayAbbrev(day) + " " + clock
 	}
-	return strconv.FormatInt(n, 10)
+	return clock
 }
 
 // formatClock formats a minute-of-day (0–1439) as "HH:MM". Returns "" if min < 0.

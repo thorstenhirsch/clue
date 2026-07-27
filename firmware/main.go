@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-const buildID = "CLUE-FW-21"
+const (
+	buildID        = "CLUE-FW-23"
+	hostLEDTimeout = 60 * time.Second
+)
 
 type state uint8
 
@@ -21,10 +24,15 @@ const (
 var (
 	display      EPD
 	currentState state
-	lastUsage    = UsageData{H5Limit: -1, H5ResetMin: -1, W1ResetDay: -1, W1ResetMin: -1}
-	serialBuf    [4096]byte
-	serialPos    int
-	led          machine.Pin
+	lastUsage    = UsageData{
+		PrimaryLimit: -1, PrimaryResetDay: -1, PrimaryResetMin: -1,
+		SecondaryResetDay: -1, SecondaryResetMin: -1,
+	}
+	serialBuf        [4096]byte
+	serialPos        int
+	led              machine.Pin
+	hostActive       bool
+	lastHostActivity time.Time
 )
 
 func main() {
@@ -47,7 +55,7 @@ func main() {
 
 	led = machine.P0_11
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	led.High() // steady reading light
+	led.Low() // reading light stays off until a host daemon connects
 
 	token := readToken()
 	if token == "" {
@@ -68,6 +76,10 @@ func main() {
 			handleMessage(line)
 		} else {
 			time.Sleep(50 * time.Millisecond)
+			if hostActive && time.Since(lastHostActivity) >= hostLEDTimeout {
+				led.Low()
+				hostActive = false
+			}
 			heartbeatTicks++
 			if heartbeatTicks >= 40 {
 				sendLine(greeting)
@@ -81,6 +93,7 @@ func handleMessage(line string) {
 	if len(line) == 0 {
 		return
 	}
+	noteHostActivity()
 	switch {
 	case line == "G":
 		token := readToken()
@@ -142,6 +155,7 @@ func handleMessage(line string) {
 
 	case line == "L:0":
 		led.Low()
+		hostActive = false
 	case line == "L:1":
 		led.High()
 
@@ -163,6 +177,14 @@ func handleMessage(line string) {
 				" diff=" + strconv.Itoa(display.DiffCount) +
 				" timeout=" + strconv.FormatBool(display.LastTimeout))
 		}
+	}
+}
+
+func noteHostActivity() {
+	lastHostActivity = time.Now()
+	if !hostActive {
+		led.High()
+		hostActive = true
 	}
 }
 
@@ -196,25 +218,35 @@ func parseUsage(data string) (UsageData, bool) {
 	if len(parts) < 7 {
 		return UsageData{}, false
 	}
-	h5u, err1 := strconv.ParseInt(parts[0], 10, 64)
-	h5l, err2 := strconv.ParseInt(parts[1], 10, 64)
-	w1u, err3 := strconv.ParseInt(parts[2], 10, 64)
-	w1l, err4 := strconv.ParseInt(parts[3], 10, 64)
-	h5rm, err5 := strconv.ParseInt(parts[4], 10, 64)
-	w1rd, err6 := strconv.ParseInt(parts[5], 10, 64)
-	w1rm, err7 := strconv.ParseInt(parts[6], 10, 64)
+	primaryUsed, err1 := strconv.ParseInt(parts[0], 10, 64)
+	primaryLimit, err2 := strconv.ParseInt(parts[1], 10, 64)
+	secondaryUsed, err3 := strconv.ParseInt(parts[2], 10, 64)
+	secondaryLimit, err4 := strconv.ParseInt(parts[3], 10, 64)
+	primaryResetMin, err5 := strconv.ParseInt(parts[4], 10, 64)
+	secondaryResetDay, err6 := strconv.ParseInt(parts[5], 10, 64)
+	secondaryResetMin, err7 := strconv.ParseInt(parts[6], 10, 64)
 	if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil || err6 != nil || err7 != nil {
 		return UsageData{}, false
 	}
-	return UsageData{
-		H5Used:     h5u,
-		H5Limit:    h5l,
-		W1Used:     w1u,
-		W1Limit:    w1l,
-		H5ResetMin: h5rm,
-		W1ResetDay: w1rd,
-		W1ResetMin: w1rm,
-	}, true
+	u := UsageData{
+		PrimaryUsed: primaryUsed, PrimaryLimit: primaryLimit,
+		SecondaryUsed: secondaryUsed, SecondaryLimit: secondaryLimit,
+		PrimaryResetDay: -1, PrimaryResetMin: primaryResetMin,
+		SecondaryResetDay: secondaryResetDay, SecondaryResetMin: secondaryResetMin,
+		PrimaryWindowMin: 5 * 60, SecondaryWindowMin: 7 * 24 * 60,
+	}
+	if len(parts) >= 10 {
+		primaryResetDay, err8 := strconv.ParseInt(parts[7], 10, 64)
+		primaryWindowMin, err9 := strconv.ParseInt(parts[8], 10, 64)
+		secondaryWindowMin, err10 := strconv.ParseInt(parts[9], 10, 64)
+		if err8 != nil || err9 != nil || err10 != nil {
+			return UsageData{}, false
+		}
+		u.PrimaryResetDay = primaryResetDay
+		u.PrimaryWindowMin = primaryWindowMin
+		u.SecondaryWindowMin = secondaryWindowMin
+	}
+	return u, true
 }
 
 func readLine() string {
