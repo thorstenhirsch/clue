@@ -1,9 +1,6 @@
 package main
 
 func updateUsage(d *EPD, lastUsage *UsageData, u UsageData) {
-	if barTurnsRed(lastUsage, &u) {
-		d.ForceFullNext = true
-	}
 	blinks := blinkCount(lastUsage, &u)
 	*lastUsage = u
 	renderUsageScreen(d, &u)

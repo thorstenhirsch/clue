@@ -1,6 +1,7 @@
 package main
 
 import (
+	"image/color"
 	"machine"
 	"strconv"
 	"strings"
@@ -8,7 +9,7 @@ import (
 )
 
 const (
-	buildID        = "CLUE-FW-24"
+	buildID        = "CLUE-FW-26"
 	hostLEDTimeout = 60 * time.Second
 )
 
@@ -33,6 +34,8 @@ var (
 	led              machine.Pin
 	hostActive       bool
 	lastHostActivity time.Time
+
+	refreshExperimentBWInverted bool
 )
 
 func main() {
@@ -112,6 +115,7 @@ func handleMessage(line string) {
 		updateUsage(&display, &lastUsage, u)
 		sendLine("DBG:U ms=" + strconv.Itoa(display.LastRefreshMS) +
 			" diff=" + strconv.Itoa(display.DiffCount) +
+			" ghost=" + strconv.Itoa(display.GhostBudget) +
 			" tier=" + display.LastTier)
 
 	case line == "E":
@@ -156,6 +160,9 @@ func handleMessage(line string) {
 		sendLine("DBG:T:C done ms=" + strconv.Itoa(display.LastRefreshMS) +
 			" timeout=" + strconv.FormatBool(display.LastTimeout))
 
+	case strings.HasPrefix(line, "Q:"):
+		handleRefreshExperiment(line[2:])
+
 	case line == "L:0":
 		led.Low()
 		hostActive = false
@@ -183,6 +190,145 @@ func handleMessage(line string) {
 	}
 }
 
+// handleRefreshExperiment serves the clue-test hardware lab. Q: commands are
+// intentionally separate from the production protocol and settings are never
+// persisted. Every BASE/RECOVER command uses the panel's true OTP waveform.
+func handleRefreshExperiment(data string) {
+	parts := strings.Split(data, ":")
+	if len(parts) < 2 {
+		sendLine("DBG:Q parse error")
+		return
+	}
+	test, stage := parts[0], parts[1]
+	switch test + ":" + stage {
+	case "BW:BASE":
+		refreshExperimentBWInverted = false
+		renderBWExperiment(&display, false)
+		display.DisplayFull()
+	case "BW:RUN":
+		reps, frames, ok := experimentArgs(parts, 1, 50, 1, 255)
+		if !ok {
+			return
+		}
+		refreshExperimentBWInverted = !refreshExperimentBWInverted
+		renderBWExperiment(&display, refreshExperimentBWInverted)
+		if !display.refreshSelectiveBW(reps, frames, "test-bw") && display.LastTier == "test-rejected" {
+			sendLine("DBG:Q rejected (red pixels present)")
+			return
+		}
+	case "RA:BASE":
+		renderRedAddExperiment(&display, false)
+		display.DisplayFull()
+	case "RA:RUN":
+		passes, rp, ok := experimentArgs(parts, 1, 6, 0, 255)
+		if !ok {
+			return
+		}
+		renderRedAddExperiment(&display, true)
+		if !display.refreshSelectiveRed(passes, rp) && display.LastTier == "test-rejected" {
+			sendLine("DBG:Q rejected (red removal requested)")
+			return
+		}
+	case "RC:BASE":
+		renderRedClearExperiment(&display, false)
+		display.DisplayFull()
+	case "RC:RUN":
+		passes, rp, ok := experimentArgs(parts, 1, 6, 0, 255)
+		if !ok {
+			return
+		}
+		renderRedClearExperiment(&display, true)
+		display.refreshRedClear(passes, rp)
+	case "ALL:RECOVER":
+		renderRefreshReference(&display)
+		display.DisplayFull()
+	default:
+		sendLine("DBG:Q unknown experiment")
+		return
+	}
+	sendLine("DBG:Q test=" + test + " stage=" + stage +
+		" fw=" + buildID +
+		" ms=" + strconv.Itoa(display.LastRefreshMS) +
+		" tier=" + display.LastTier +
+		" timeout=" + strconv.FormatBool(display.LastTimeout))
+}
+
+func experimentArgs(parts []string, minA, maxA, minB, maxB int) (int, int, bool) {
+	if len(parts) != 4 {
+		sendLine("DBG:Q expected two numeric parameters")
+		return 0, 0, false
+	}
+	a, e1 := strconv.Atoi(parts[2])
+	b, e2 := strconv.Atoi(parts[3])
+	if e1 != nil || e2 != nil || a < minA || a > maxA || b < minB || b > maxB {
+		sendLine("DBG:Q invalid parameters")
+		return 0, 0, false
+	}
+	return a, b, true
+}
+
+func fillTestRect(d *EPD, x, y, w, h int16, c color.RGBA) {
+	for py := y; py < y+h; py++ {
+		for px := x; px < x+w; px++ {
+			d.SetPixel(px, py, c)
+		}
+	}
+}
+
+func renderRefreshReference(d *EPD) {
+	d.ClearBuffer()
+	fillTestRect(d, 8, 8, 84, 48, black)
+	fillTestRect(d, 106, 8, 84, 48, red)
+	// The right block stays white; the three large swatches make recovery and
+	// relative pigment strength easy to judge without relying on tiny text.
+	fillTestRect(d, 204, 8, 84, 48, white)
+}
+
+func renderBWExperiment(d *EPD, inverted bool) {
+	d.ClearBuffer()
+	for y := int16(8); y < 120; y += 16 {
+		for x := int16(8); x < 288; x += 16 {
+			dark := ((x-8)/16+(y-8)/16)%2 == 0
+			if inverted {
+				dark = !dark
+			}
+			if dark {
+				fillTestRect(d, x, y, 16, 16, black)
+			}
+		}
+	}
+	// Solid rails expose weak black and residual white more clearly than the
+	// checkerboard alone.
+	if inverted {
+		fillTestRect(d, 0, 0, 296, 5, black)
+	} else {
+		fillTestRect(d, 0, 123, 296, 5, black)
+	}
+}
+
+func renderRedAddExperiment(d *EPD, add bool) {
+	d.ClearBuffer()
+	fillTestRect(d, 12, 16, 80, 80, black)
+	fillTestRect(d, 108, 16, 80, 80, red) // existing red reference
+	fillTestRect(d, 204, 16, 80, 80, black)
+	if add {
+		fillTestRect(d, 12, 16, 80, 80, red)  // black -> new red
+		fillTestRect(d, 204, 16, 40, 80, red) // adjacent new red/black edge
+	}
+}
+
+func renderRedClearExperiment(d *EPD, clear bool) {
+	d.ClearBuffer()
+	fillTestRect(d, 12, 16, 80, 80, red)
+	fillTestRect(d, 108, 16, 80, 80, red)
+	fillTestRect(d, 204, 16, 80, 80, red)
+	if clear {
+		fillTestRect(d, 12, 16, 80, 80, white)  // red -> white
+		fillTestRect(d, 108, 16, 80, 80, black) // red -> black
+		// Third swatch remains red as a saturation reference.
+	}
+}
+
 func noteHostActivity() {
 	lastHostActivity = time.Now()
 	if !hostActive {
@@ -206,7 +352,7 @@ func setProvider(id string) {
 
 // handleTuning parses "X:<bwReps>:<triPasses>:<redRP>" and updates the
 // live refresh parameters (RAM-only, reset to defaults on reboot).
-// "X:6:3:4" = defaults. See the tunable vars in epd.go.
+// "X:6:3:3" = defaults. See the tunable vars in epd.go.
 func handleTuning(data string) {
 	parts := strings.Split(data, ":")
 	if len(parts) < 3 {

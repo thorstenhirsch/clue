@@ -21,13 +21,20 @@ const (
 const redPixelClearsBit = false
 
 // Tunable refresh parameters (RAM-only; adjust live via the "X:" serial
-// command, e.g. "X:6:3:4" = defaults). Hardware-tuned July 2026: bwReps 6 is
+// command, e.g. "X:6:3:3" = defaults). Hardware-tuned July 2026: bwReps 6 is
 // the verified minimum with no shadows (X:6:2:4 showed shadows, so triPasses
 // stays at 3). "X:10:3:4" reproduces the CLUE-FW-19 frame sequence.
 var (
 	bwReps    = 6 // B/W refresh: reps of the 10-frame reinforcement group
 	triPasses = 3 // tri-color: number of interleaved [BW + red] group pairs
-	redRP     = 4 // tri-color: RP field of each red group (4 = 5 reps × 30 frames)
+	redRP     = 3 // tri-color: RP field (3 = 4 reps × 30 frames), verified strong
+)
+
+const (
+	selectiveBWReps   = 3
+	selectiveBWFrames = 10
+	ghostBudgetLimit  = 32
+	fullDriveCost     = 4 // preserves full-after-8 for tri/fallback refreshes
 )
 
 // buildTriLUT constructs the no-clear tri-color LUT (cmd 0x32 + 0xC7, Mode 1).
@@ -148,17 +155,25 @@ type EPD struct {
 	dispBuffer    [epdBufSz]uint8
 	dispRedBuffer [epdBufSz]uint8
 
-	DiffCount     int // partial refreshes since last full; auto-full at 8
+	// Test-only encoded RAM planes. Experimental Mode-1 refreshes use the two
+	// controller RAMs as four waveform selectors instead of as literal BW/red
+	// images. Keeping these separate ensures the render buffers and displayed
+	// snapshots always retain their normal meaning.
+	testBW  [epdBufSz]uint8
+	testRed [epdBufSz]uint8
+
+	DiffCount     int // custom refreshes since last full (telemetry)
+	GhostBudget   int // selective BW costs 1; tri/fallback costs 4; full at 32
 	LastRefreshMS int
 	LastTimeout   bool
 	LastTier      string // "full", "fastfull", "tri", "bw", "skip" — last refresh method
 	ForceFullNext bool   // set true to force full OTP on next RefreshSmart
 
 	// FastFullMode (default true; "M:0" disables): RefreshSmart's internal
-	// full refreshes (anti-ghost every-8, red-cleared) use the temp-spoofed
+	// full refreshes (weighted anti-ghost budget, red-cleared) use temp-spoofed
 	// 90°C OTP waveform instead of the sensor-temp 0xF7 — same phase
 	// structure, faster clocking. Verified equivalent on hardware July 2026.
-	// Explicit fulls (init, 4am F, red first appearing) always use true 0xF7.
+	// Explicit fulls (init and the host's 4am F) use true 0xF7.
 	FastFullMode bool
 }
 
@@ -290,14 +305,19 @@ func (d *EPD) displayFull(fast bool) error {
 	d.LastRefreshMS = totalMS
 	d.LastTimeout = timedOut
 	d.DiffCount = 0
-	d.ForceFullNext = false
+	d.GhostBudget = 0
+	d.ForceFullNext = timedOut
 	if fast {
 		d.LastTier = "fastfull"
 	} else {
 		d.LastTier = "full"
 	}
 
-	// Snapshot the displayed image for future diffs
+	if timedOut {
+		return nil
+	}
+
+	// Snapshot the displayed image for future diffs only after BUSY completed.
 	copy(d.dispBuffer[:], d.buffer[:])
 	copy(d.dispRedBuffer[:], d.redBuffer[:])
 	return nil
@@ -321,8 +341,8 @@ func (d *EPD) RefreshSmart() error {
 	// Red pixels were removed (e.g. usage dropped below 80% after a reset) —
 	// a no-clear tri-color pass can't erase red, so force a full OTP refresh.
 	// FastFullMode applies only to the internal triggers (anti-ghost, red
-	// cleared); ForceFullNext (init, red first appearing) stays true 0xF7.
-	if d.ForceFullNext || d.DiffCount >= 8 ||
+	// cleared); ForceFullNext (init or timeout recovery) stays true 0xF7.
+	if d.ForceFullNext || d.GhostBudget >= ghostBudgetLimit ||
 		anyRedCleared(d.dispRedBuffer[:], d.redBuffer[:]) {
 		return d.displayFull(d.FastFullMode && !d.ForceFullNext)
 	}
@@ -331,7 +351,11 @@ func (d *EPD) RefreshSmart() error {
 		return d.refreshTriColor()
 	}
 
-	// B/W only — full-screen differential, flicker-free
+	// With no physical red, use transition-selective Mode 1, verified clean
+	// through 32 full-screen alternations. Fall back when red is present.
+	if d.refreshSelectiveBW(selectiveBWReps, selectiveBWFrames, "bw-selective") {
+		return nil
+	}
 	return d.refreshPartialBW()
 }
 
@@ -367,7 +391,12 @@ func (d *EPD) refreshTriColor() error {
 
 	d.LastRefreshMS = ms
 	d.LastTimeout = timedOut
+	if timedOut {
+		d.ForceFullNext = true
+		return nil
+	}
 	d.DiffCount++
+	d.GhostBudget += fullDriveCost
 	d.LastTier = "tri"
 
 	copy(d.dispBuffer[:], d.buffer[:])
@@ -409,12 +438,181 @@ func (d *EPD) refreshPartialBW() error {
 
 	d.LastRefreshMS = ms
 	d.LastTimeout = timedOut
+	if timedOut {
+		d.ForceFullNext = true
+		return nil
+	}
 	d.DiffCount++
+	d.GhostBudget += fullDriveCost
 	d.LastTier = "bw"
 
 	copy(d.dispBuffer[:], d.buffer[:])
 	copy(d.dispRedBuffer[:], d.redBuffer[:])
 	return nil
+}
+
+// buildSelectiveBWLUT maps Mode-1 LUT1 to white->black and LUT2 to
+// black->white. LUT0 is used for every unchanged pixel and remains VSS.
+func buildSelectiveBWLUT(reps, frames int) [153]byte {
+	var lut [153]byte
+	lut[1*12] = 0x40 // W->B: VSH1 (black on this panel)
+	lut[2*12] = 0x80 // B->W: VSL (white on this panel)
+	lut[60] = byte(frames)
+	lut[60+6] = byte(reps - 1)
+	for i := 144; i < 150; i++ {
+		lut[i] = 0x33
+	}
+	return lut
+}
+
+// refreshSelectiveBW obtains transition-aware behavior without SSD1680 Mode 2:
+// the two Mode-1 RAM bits encode unchanged, W->B, and B->W. It is only valid
+// while no physical red is displayed.
+func (d *EPD) refreshSelectiveBW(reps, frames int, tier string) bool {
+	for i := range d.dispRedBuffer {
+		if d.dispRedBuffer[i] != 0 || d.redBuffer[i] != 0 {
+			d.LastTier = "test-rejected"
+			return false
+		}
+		d.testBW[i] = 0
+		d.testRed[i] = 0
+		old := d.dispBuffer[i]
+		cur := d.buffer[i]
+		// class 1 (red=0,bw=1): white -> black
+		d.testBW[i] = old &^ cur
+		// class 2 (red=1,bw=0): black -> white
+		d.testRed[i] = (^old) & cur
+	}
+	lut := buildSelectiveBWLUT(reps, frames)
+	d.refreshEncoded(d.testBW[:], d.testRed[:], lut[:], tier)
+	return !d.LastTimeout
+}
+
+// buildSelectiveRedLUT maps class 0=existing red (VSS), class 1=new red,
+// class 2=target black, class 3=target white. New red uses the same verified
+// interleaved BW-clear/red-drive sequence as the production tri-color LUT.
+func buildSelectiveRedLUT(passes, redRepeat int) [153]byte {
+	var lut [153]byte
+	for p := 0; p < passes; p++ {
+		gBW, gRed := 2*p, 2*p+1
+		lut[1*12+gBW] = 0x80  // new red: clear black residue
+		lut[1*12+gRed] = 0xC0 // new red: drive red
+		lut[2*12+gBW] = 0x40  // target black
+		lut[3*12+gBW] = 0x80  // target white
+		lut[60+7*gBW] = 10
+		lut[60+7*gRed] = 30
+		lut[60+7*gRed+6] = byte(redRepeat)
+	}
+	for i := 144; i < 150; i++ {
+		lut[i] = 0x33
+	}
+	return lut
+}
+
+func (d *EPD) refreshSelectiveRed(passes, redRepeat int) bool {
+	for i := range d.dispRedBuffer {
+		if d.dispRedBuffer[i]&^d.redBuffer[i] != 0 {
+			d.LastTier = "test-rejected"
+			return false // this waveform is additive only
+		}
+		d.testBW[i], d.testRed[i] = 0, 0
+		for bit := uint8(0x80); bit != 0; bit >>= 1 {
+			class := uint8(0)
+			oldRed := d.dispRedBuffer[i]&bit != 0
+			newRed := d.redBuffer[i]&bit != 0
+			switch {
+			case oldRed && newRed:
+				class = 0
+			case newRed:
+				class = 1
+			case d.buffer[i]&bit == 0:
+				class = 2
+			default:
+				class = 3
+			}
+			if class&1 != 0 {
+				d.testBW[i] |= bit
+			}
+			if class&2 != 0 {
+				d.testRed[i] |= bit
+			}
+		}
+	}
+	lut := buildSelectiveRedLUT(passes, redRepeat)
+	d.refreshEncoded(d.testBW[:], d.testRed[:], lut[:], "test-red-add")
+	return !d.LastTimeout
+}
+
+// buildRedClearLUT is intentionally experimental. Class 2 clears red to
+// white; class 3 clears red and then drives black. Non-red pixels are VSS.
+func buildRedClearLUT(passes, clearRepeat int) [153]byte {
+	var lut [153]byte
+	for p := 0; p < passes; p++ {
+		gClear, gBlack := 2*p, 2*p+1
+		lut[2*12+gClear] = 0x80
+		lut[3*12+gClear] = 0x80
+		lut[3*12+gBlack] = 0x40
+		lut[60+7*gClear] = 30
+		lut[60+7*gClear+6] = byte(clearRepeat)
+		lut[60+7*gBlack] = 10
+	}
+	for i := 144; i < 150; i++ {
+		lut[i] = 0x33
+	}
+	return lut
+}
+
+func (d *EPD) refreshRedClear(passes, clearRepeat int) bool {
+	for i := range d.dispRedBuffer {
+		d.testBW[i], d.testRed[i] = 0, 0
+		for bit := uint8(0x80); bit != 0; bit >>= 1 {
+			if d.dispRedBuffer[i]&bit == 0 {
+				continue
+			}
+			class := uint8(2) // red -> white
+			if d.buffer[i]&bit == 0 {
+				class = 3
+			} // red -> black
+			if class&1 != 0 {
+				d.testBW[i] |= bit
+			}
+			if class&2 != 0 {
+				d.testRed[i] |= bit
+			}
+		}
+	}
+	lut := buildRedClearLUT(passes, clearRepeat)
+	d.refreshEncoded(d.testBW[:], d.testRed[:], lut[:], "test-red-clear")
+	return !d.LastTimeout
+}
+
+func (d *EPD) refreshEncoded(bw, red, lut []byte, tier string) {
+	d.wake()
+	d.setWindow(0, 0, epdW-1, epdH-1)
+	d.setPointerNoWait(0, 0)
+	time.Sleep(5 * time.Millisecond)
+	d.cmd(0x24)
+	d.dataBlock(bw)
+	d.setPointerNoWait(0, 0)
+	d.cmd(0x26)
+	d.dataBlock(red)
+	d.cmd(0x32)
+	d.dataBlock(lut)
+	d.cmd(0x22)
+	d.data(0xC7)
+	d.cmd(0x20)
+	ms, timedOut := d.waitBusy(25000)
+	d.LastRefreshMS, d.LastTimeout, d.LastTier = ms, timedOut, tier
+	if timedOut {
+		d.ForceFullNext = true
+		return
+	}
+	d.DiffCount++
+	if tier == "bw-selective" {
+		d.GhostBudget++
+	}
+	copy(d.dispBuffer[:], d.buffer[:])
+	copy(d.dispRedBuffer[:], d.redBuffer[:])
 }
 
 func (d *EPD) ClearBuffer() {

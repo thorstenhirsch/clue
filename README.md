@@ -18,6 +18,10 @@ A physical e-ink display connected to a nice!nano (nRF52840) that shows either C
 
 Both sections render in **black** by default. When a section's usage reaches **≥80%**, its progress bar and title turn **red** using the tri-color e-ink display's native red channel. Percentages, reset times, and utilization details stay black for fast partial refresh. Window labels come from the provider's reported duration (`5-HOUR`, `WEEKLY`, and so on).
 
+With no red displayed, B/W changes use a transition-selective ~670ms refresh
+verified through 32 full-screen alternations. First red appearance uses the
+~5.46s custom tri-color waveform. Removing red still uses a full refresh.
+
 ## Hardware
 
 - [nice!nano](https://nicekeyboards.com/nice-nano/) (nRF52840 microcontroller)
@@ -157,6 +161,26 @@ systemctl --user enable --now clue
 | `make flash` | Flash universal firmware to nice!nano |
 | `make test` | Test both host provider variants |
 | `make clean` | Remove build artifacts |
+
+## Experimental refresh lab
+
+The firmware contains isolated, RAM-only waveform experiments for the exact
+SSD1680 tri-color panel. They are never selected by the normal daemon. Stop the
+daemon, build `clue-test`, and run the guided visual suite:
+
+```sh
+make clue-test
+./clue-test --refresh-test all
+```
+
+The runner pauses after every reference and experimental image and prints what
+to inspect: black density, white cleanliness, red saturation, old-image
+shadows, and timing. It always finishes with a true OTP recovery refresh.
+Individual experiments and tunables are available through `--refresh-test bw`,
+`red-add`, `red-clear`, or `cadence`, plus `--bw-reps`, `--bw-frames`,
+`--red-passes`, and `--red-rp`. The cadence test pauses after 8, 16, and 32
+alternating updates. Red removal is intentionally experimental and must not be
+promoted without repeated visual validation.
 
 ## Project Structure
 
