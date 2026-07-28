@@ -78,7 +78,7 @@ Reset minutes are local minute-of-day (0-1439, or -1), reset days use 0=Sun..6=S
   - `RefreshSmart()` compares working buffers against last-displayed snapshot, picks cheapest tier
   - Full-screen OTP (`0xF7`) for init / 4am / weighted anti-ghost budget / red pixel removal. Selective B/W costs 1 of 32; tri-color and fallback reinforcement cost 4, retaining the old full-after-8 behavior for those modes.
   - Tri-color custom LUT (`buildTriLUT` + `0xC7`, Mode 1, single activation) when red pixels are added — `triPasses` interleaved group pairs: even groups clear BW residue with VSL (white), odd groups drive VSH2 (red) 30 frames × (redRP+1) reps for saturation
-  - Transition-selective B/W refresh when no red is present: unchanged pixels use VSS, W→B uses VSH1, B→W uses VSL. Verified crystal-clear with no residue through 32 full-screen alternations at 3×10 frames (~670ms). With physical red present, use the existing reinforcement fallback.
+  - Transition-selective B/W refresh when no red is present: unchanged pixels use VSS, W→B uses VSH1, B→W uses VSL. Verified crystal-clear with no residue through 32 full-screen alternations at 3×10 frames (~670ms). With physical red present, B/W-only changes use the validated tri-color waveform (~5.46s) so the Mode 1 red selector classes reinforce rather than erase red.
   - Frame counts are live-tunable via `X:` (defaults `X:6:3:3`; `X:6:2:4` showed shadows, so three tri passes remain the floor)
   - Pixel diff skips refresh entirely when nothing changed
 - **All custom refreshes use Mode 1 (`0xC7`)** — Mode 2 (`0xCF`, differential) was abandoned because its LUT index mapping depends on controller state that the OTP modifies unpredictably, causing B/W inversion on the first custom refresh after any 0xF7
@@ -251,7 +251,7 @@ Spoofing the temperature register (cmd 0x1A) selects a different band.
 
 **Key insight**: The SSD1680 voltage registers persist between refreshes. A 0xF7 refresh auto-loads them from OTP. Subsequent custom LUT operations reference the same correct voltages — no manual writes needed. This is how GxEPD2 (mono partial) works: OTP loads voltages, then `0xFC` (OTP Mode 2) reuses them.
 
-**B/W flow** (Mode 1, full-screen, single activation): with no physical red, the two RAM planes encode class 0=unchanged/VSS, class 1=white→black/VSH1, and class 2=black→white/VSL without relying on Mode 2 state. When red exists, production writes the target buffers and uses `buildDiffLUT(bwReps)` reinforcement because four selector classes cannot also preserve red.
+**B/W flow** (Mode 1, full-screen, single activation): with no physical red, the two RAM planes encode class 0=unchanged/VSS, class 1=white→black/VSH1, and class 2=black→white/VSL without relying on Mode 2 state. When red exists, production uses `buildTriLUT` even for B/W-only changes. The old `buildDiffLUT` fallback mapped its red selector classes to black/white and could progressively erase an unchanged red progress bar.
 
 **Red/tri-color flow** (Mode 1, single activation): write full BW+red to 0x24/0x26, upload `buildTriLUT(triPasses, redRP)`, trigger 0xC7 **once**. The LUT contains `triPasses` interleaved group pairs — a 10-frame BW reinforce/clear group followed by a 30-frame × (redRP+1) VSH2 red-drive group — reproducing the old 3-trigger pass structure inside one activation (saves two power cycles vs CLUE-FW-19, ~15s for OTP full as comparison). Red is additive-only between resets — the no-clear LUT never erases red.
 
@@ -265,7 +265,7 @@ Spoofing the temperature register (cmd 0x1A) selects a different band.
 - `RefreshSmart()` picks the cheapest tier via pixel-level diffing:
   - Full-screen OTP for init / 4am / every 8 partials / red pixel removal (`anyRedCleared()`); the anti-ghost and red-removal fulls use the temp-spoofed fast OTP waveform by default (disable via `M:0`) — hardware-verified equivalent to true 0xF7 for ghost clearing and red quality (July 2026)
   - Tri-color custom LUT (`buildTriLUT` + `0xC7`, single activation, interleaved groups) for additive red changes
-  - Fast B/W (`buildDiffLUT` + `0xC7`, single activation, reinforcement) for B/W-only changes — **no voltage register writes**
+  - Fast transition-selective B/W (`0xC7`, single activation) for B/W-only changes when no red exists; B/W-only changes with red present use the tri-color LUT to preserve the pigment
   - Skip when nothing changed
 - Defaults hardware-tuned July 2026: selective B/W `3×10` frames; red/fallback tuple `X:6:3:3`. Three tri passes remain the floor (`X:6:2:4` shadowed).
 - `X:` serial command live-tunes frame counts; `M:0|1` toggles fast-full — both without reflashing

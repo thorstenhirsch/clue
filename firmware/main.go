@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	buildID        = "CLUE-FW-26"
+	buildID        = "CLUE-FW-27"
 	hostLEDTimeout = 60 * time.Second
 )
 

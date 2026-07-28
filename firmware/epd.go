@@ -141,6 +141,15 @@ func anyRedCleared(disp, cur []byte) bool {
 	return false
 }
 
+func anyRedPixels(buf []byte) bool {
+	for _, b := range buf {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 type EPD struct {
 	bus  drivers.SPI
 	cs   machine.Pin
@@ -328,7 +337,8 @@ func (d *EPD) displayFull(fast bool) error {
 //   - nothing changed → skip
 //   - forced full / anti-ghost / red cleared → full-screen OTP (0xF7)
 //   - red pixels added → tri-color custom LUT (0xC7, no-clear, additive)
-//   - B/W only changed → fast partial (diffLUT + 0xC7, no flicker)
+//   - B/W only changed, no red present → fast selective update
+//   - B/W only changed, red present → tri-color update (preserves red)
 func (d *EPD) RefreshSmart() error {
 	bwBox := diffBox(d.buffer[:], d.dispBuffer[:])
 	redBox := diffBox(d.redBuffer[:], d.dispRedBuffer[:])
@@ -347,12 +357,17 @@ func (d *EPD) RefreshSmart() error {
 		return d.displayFull(d.FastFullMode && !d.ForceFullNext)
 	}
 
-	if !redBox.empty {
+	// Mode 1 selects a waveform from both RAM bits. The B/W reinforcement LUT's
+	// red selector entries drive black/white, so using it while physical red is
+	// present progressively erases that pigment even when the red buffer itself
+	// is unchanged. Re-run the validated tri-color waveform to preserve and
+	// reinforce red during unrelated B/W changes.
+	if !redBox.empty || anyRedPixels(d.redBuffer[:]) {
 		return d.refreshTriColor()
 	}
 
 	// With no physical red, use transition-selective Mode 1, verified clean
-	// through 32 full-screen alternations. Fall back when red is present.
+	// through 32 full-screen alternations.
 	if d.refreshSelectiveBW(selectiveBWReps, selectiveBWFrames, "bw-selective") {
 		return nil
 	}
@@ -414,6 +429,12 @@ func (d *EPD) refreshTriColor() error {
 // single activation (reinforcement prevents fading) — the 5-trigger loop of
 // CLUE-FW-19 folded into the LUT's repeat count, saving four power cycles.
 func (d *EPD) refreshPartialBW() error {
+	// Defensive guard: buildDiffLUT cannot preserve red selector classes.
+	// RefreshSmart normally routes this case before reaching this function.
+	if anyRedPixels(d.dispRedBuffer[:]) || anyRedPixels(d.redBuffer[:]) {
+		return d.refreshTriColor()
+	}
+
 	d.wake()
 	d.setWindow(0, 0, epdW-1, epdH-1)
 
